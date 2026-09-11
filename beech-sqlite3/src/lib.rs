@@ -439,6 +439,25 @@ pub fn create_beech_module(conn: &rusqlite::Connection) -> Result<()> {
     conn.create_module::<BeechTable, _>("beech", &MODULE, None)
 }
 
+// SQLite finds this C entry point when the DLL is loaded with `.load`.
+#[cfg(feature = "loadable_extension")]
+#[unsafe(no_mangle)]
+unsafe extern "C" fn sqlite3_extension_init(
+    db: *mut rusqlite::ffi::sqlite3,
+    error_message: *mut *mut std::ffi::c_char,
+    api: *mut rusqlite::ffi::sqlite3_api_routines,
+) -> c_int {
+    // SAFETY: SQLite supplies the live connection, error output, and API table.
+    // The callback only registers our module; rusqlite borrows the connection
+    // and translates initialization errors into SQLite's return convention.
+    unsafe {
+        rusqlite::Connection::extension_init2(db, error_message, api, |connection| {
+            create_beech_module(&connection)?;
+            Ok(false) // SQLite may unload the DLL when the connection closes.
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

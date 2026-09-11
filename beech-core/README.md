@@ -70,6 +70,33 @@ encoded root object's ID. It prints the row count and the first five rows.
 SQLite exposes Decimal128 and UInt64 as exact text; SQLite numeric conversions
 apply when SQL expressions perform arithmetic on those values.
 
+To use the native SQLite shell, build the adapter with its loadable-extension
+feature. This uses the shell's SQLite API; the default build bundles SQLite for
+the Rust runner and tests.
+
+```powershell
+cargo build -p beech-sqlite3 --lib --no-default-features --features loadable_extension
+cargo run -p beech-core --example interoperability -- write target/sqlite-demo
+Copy-Item target/sqlite-demo/root-id.txt target/sqlite-demo/root
+sqlite3
+```
+
+Then, from the repository root in the SQLite shell:
+
+```sql
+.load ./target/debug/beech_sqlite3
+.headers on
+.mode column
+CREATE VIRTUAL TABLE items USING beech('target/sqlite-demo', 'unused', 'example');
+SELECT count(*) FROM items;
+SELECT rowid, key, label FROM items WHERE key >= 3 ORDER BY key;
+```
+
+On Linux/macOS, use `.load ./target/debug/libbeech_sqlite3` and `cp` for the
+root-file copy. Rebuild with the extension feature after building the bundled
+adapter, since both modes use the same library filename. Run adapter tests with
+the default features: `cargo test -p beech-sqlite3`.
+
 Generated Thrift Rust is checked in. To regenerate it with Thrift 0.24.0:
 
 ```powershell

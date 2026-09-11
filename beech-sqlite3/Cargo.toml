@@ -3,6 +3,14 @@ name = "beech-sqlite3"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = ["bundled"]
+bundled = ["rusqlite/bundled"]
+loadable_extension = ["rusqlite/loadable_extension"]
+
 [dependencies]
 rusqlite.workspace = true
 beech-core = { path = "../beech-core" }
