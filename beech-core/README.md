@@ -4,7 +4,7 @@ A content-addressed prolly tree with column-oriented Parquet leaves and Thrift
 Compact Protocol metadata. Each leaf contains exactly one row group. The tree
 builder determines leaf boundaries.
 
-This migration currently covers core. The writer, SQLite adapter, CLI, and
+This migration currently covers core and the SQLite adapter. The writer, CLI, and
 shared fixtures still need migration. The previous storage format is incompatible.
 
 ## Layout
@@ -57,6 +57,18 @@ cargo test -p beech-core --locked
 cargo clippy -p beech-core --all-targets --locked -- -D warnings
 cargo fmt -p beech-core -- --check
 ```
+
+The SQLite adapter uses the same repository and supports projected SQL scans:
+
+```text
+cargo test -p beech-sqlite3 --locked
+cargo run -p beech-sqlite3-test -- path/to/data table_name
+```
+
+The runner expects content-ID filenames and a text `root` file containing the
+encoded root object's ID. It prints the row count and the first five rows.
+SQLite exposes Decimal128 and UInt64 as exact text; SQLite numeric conversions
+apply when SQL expressions perform arithmetic on those values.
 
 Generated Thrift Rust is checked in. To regenerate it with Thrift 0.24.0:
 

@@ -18,6 +18,7 @@ temporary=$(mktemp "$output_path.XXXXXX")
 trap 'rm -f "$temporary"' 0
 tr -d '\r' < "$output_path" | sed \
     -e '/^use thrift::server::TProcessor;$/d' \
-    -e '/^#!\[cfg_attr(rustfmt, rustfmt_skip)\]$/d' > "$temporary"
+    -e '/^#!\[cfg_attr(rustfmt, rustfmt_skip)\]$/d' \
+    -e 's/thrift::/beech_core::thrift::/g' > "$temporary"
 cat "$temporary" > "$output_path"
 rustfmt --edition 2024 "$output_path"

@@ -4,16 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rusqlite = { version = "0.37.0", features = ["vtab", "modern_sqlite"] }
+rusqlite.workspace = true
 beech-core = { path = "../beech-core" }
-thrift = { version = "=0.24.0", default-features = false }
-beech-mem = { path = "../beech-mem" }
-beech-shaper = { path = "../beech-shaper" }
-thiserror.workspace = true
-log = "0.4"
-env_logger = "0.11"
+arrow-array = "=59.3.0"
 
 [dev-dependencies]
-beech-write = { path = "../beech-write" }
-beech-test-fixtures = { path = "../beech-test-fixtures" }
+bytes = "1.10"
 tempfile = "3"

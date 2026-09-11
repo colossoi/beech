@@ -16,4 +16,5 @@ struct AccessPlan {
   3: required bool preserves_order,
   4: required double estimated_cost,
   5: required i64 estimated_rows
+  6: required list<i32> projection
 }

@@ -4,7 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-env_logger = "0.11.8"
-#rusqlite = { version = "0.37.0", features = ["vtab", "modern_sqlite", "loadable_extension", "bundled"] }
-rusqlite = { version = "0.37.0", features = ["vtab", "modern_sqlite", "bundled"] }
+rusqlite.workspace = true
 beech-sqlite3 = { path = "../beech-sqlite3"}

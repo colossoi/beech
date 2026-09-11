@@ -1,14 +1,14 @@
 //! SQLite access plans: argument slots, binding, and idx_str serialization.
+use beech_core::thrift::{
+    TConfiguration,
+    protocol::{TCompactInputProtocol, TCompactOutputProtocol, TSerializable},
+};
 use beech_core::{
     BeechError, Id, Result, Scalar, Table,
     plan::{self, CandidateConstraint, PlanEstimate},
     query::{ConstraintOp, Predicate, ScanRequest},
 };
 use std::io::Cursor;
-use thrift::{
-    TConfiguration,
-    protocol::{TCompactInputProtocol, TCompactOutputProtocol, TSerializable},
-};
 #[path = "generated/plan.rs"]
 mod generated;
 use generated as g;
@@ -19,6 +19,7 @@ pub(super) struct AccessPlan {
     pub(super) search: Vec<SearchSlot>,
     pub(super) preserves_order: bool,
     pub(super) estimate: PlanEstimate,
+    pub(super) projection: Vec<usize>,
 }
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct SearchSlot {
@@ -28,11 +29,16 @@ pub(super) struct SearchSlot {
     pub(super) argv_index: i32,
 }
 impl AccessPlan {
-    pub(super) fn select(table_id: Id, table: &Table, candidates: &[CandidateConstraint]) -> Result<Self> {
+    pub(super) fn select(
+        table_id: Id,
+        table: &Table,
+        candidates: &[CandidateConstraint],
+    ) -> Result<(Self, Vec<usize>)> {
         let selected = plan::select_key_prefix(table.schema(), candidates);
         let estimate = plan::estimate(table, selected.iter().map(|&i| candidates[i]));
         let search = selected
-            .into_iter()
+            .iter()
+            .copied()
             .enumerate()
             .map(|(part, index)| {
                 let c = candidates[index];
@@ -48,12 +54,16 @@ impl AccessPlan {
                 })
             })
             .collect::<Result<_>>()?;
-        Ok(Self {
-            table_id,
-            search,
-            preserves_order: false,
-            estimate,
-        })
+        Ok((
+            Self {
+                table_id,
+                search,
+                preserves_order: false,
+                estimate,
+                projection: (0..table.schema().fields().len()).collect(),
+            },
+            selected,
+        ))
     }
     fn validate(&self) -> Result<()> {
         if !self.estimate.estimated_cost.is_finite()
@@ -82,17 +92,23 @@ impl AccessPlan {
         Ok(())
     }
     /// Bind arguments using the ID and table loaded from the same catalog entry.
-    pub(super) fn bind(&self, table_id: Id, table: &Table, args: &[Scalar]) -> Result<ScanRequest> {
+    pub(super) fn bind(&self, table_id: Id, table: &Table, args: &[Option<Scalar>]) -> Result<ScanRequest> {
         self.validate()?;
         if self.table_id != table_id || args.len() != self.search.len() {
             return Err(BeechError::Query("plan table or argument mismatch".into()));
         }
         let mut request = ScanRequest::all(table);
+        request.projection.clone_from(&self.projection);
+        request.include_row_id = true;
         for (s, value) in self.search.iter().zip(args) {
             if table.schema().key_columns().get(s.key_part as usize) != Some(&(s.column as usize)) {
                 return Err(BeechError::Query("plan key column mismatch".into()));
             }
-            request.predicates.push(Predicate::new(s.column as usize, s.op, value.clone()));
+            // SQLite rechecks every constraint. If conversion cannot preserve its
+            // comparison semantics, leave that constraint entirely to SQLite.
+            if let Some(value) = value {
+                request.predicates.push(Predicate::new(s.column as usize, s.op, value.clone()));
+            }
         }
         request.validate(table)?;
         Ok(request)
@@ -149,6 +165,13 @@ fn encode_plan(p: &AccessPlan) -> Result<Vec<u8>> {
         p.preserves_order,
         p.estimate.estimated_cost.into(),
         p.estimate.estimated_rows,
+        p.projection
+            .iter()
+            .map(|&column| {
+                i32::try_from(column)
+                    .map_err(|_| BeechError::Query("projection column exceeds i32 representation".into()))
+            })
+            .collect::<Result<_>>()?,
     ))
 }
 fn decode_plan(bytes: &[u8]) -> Result<AccessPlan> {
@@ -172,6 +195,13 @@ fn decode_plan(bytes: &[u8]) -> Result<AccessPlan> {
             estimated_cost: p.estimated_cost.into_inner(),
             estimated_rows: p.estimated_rows,
         },
+        projection: p
+            .projection
+            .into_iter()
+            .map(|column| {
+                usize::try_from(column).map_err(|_| BeechError::Query("negative projection column".into()))
+            })
+            .collect::<Result<_>>()?,
     };
     result.validate()?;
     Ok(result)
@@ -229,18 +259,31 @@ mod tests {
     fn thrift_plan_roundtrip_and_binding_validate_context() {
         let t = table(1000);
         let table_id = codec::thrift::encode_table(&t).unwrap().id();
-        let p = AccessPlan::select(table_id, &t, &[cc(1, Op::Gt), cc(0, Op::Eq)]).unwrap();
+        let (p, selected) = AccessPlan::select(table_id, &t, &[cc(1, Op::Gt), cc(0, Op::Eq)]).unwrap();
+        assert_eq!(selected, vec![1, 0]);
         let bytes = p.encode().unwrap();
         let decoded = AccessPlan::decode(&bytes).unwrap();
         assert_eq!(p, decoded);
         assert_eq!(
-            decoded.bind(table_id, &t, &[Scalar::Int64(2), Scalar::Int32(4)]).unwrap().predicates.len(),
+            decoded
+                .bind(table_id, &t, &[Some(Scalar::Int64(2)), Some(Scalar::Int32(4))])
+                .unwrap()
+                .predicates
+                .len(),
             2
         );
         assert!(decoded.bind(table_id, &t, &[]).is_err());
-        assert!(decoded.bind(Id::from([99; 32]), &t, &[Scalar::Int64(2), Scalar::Int32(4)]).is_err());
+        assert!(
+            decoded
+                .bind(
+                    Id::from([99; 32]),
+                    &t,
+                    &[Some(Scalar::Int64(2)), Some(Scalar::Int32(4))]
+                )
+                .is_err()
+        );
         let mut bad = p;
         bad.search[1].column = 99;
-        assert!(bad.bind(table_id, &t, &[Scalar::Int64(2), Scalar::Int32(4)]).is_err());
+        assert!(bad.bind(table_id, &t, &[Some(Scalar::Int64(2)), Some(Scalar::Int32(4))]).is_err());
     }
 }

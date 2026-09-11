@@ -20,17 +20,19 @@ use std::fmt;
 use std::fmt::{Display, Formatter};
 use std::rc::Rc;
 
-use thrift::OrderedFloat;
-use thrift::protocol::field_id;
-use thrift::protocol::verify_expected_message_type;
-use thrift::protocol::verify_expected_sequence_number;
-use thrift::protocol::verify_expected_service_call;
-use thrift::protocol::verify_required_field_exists;
-use thrift::protocol::{
+use beech_core::thrift::OrderedFloat;
+use beech_core::thrift::protocol::field_id;
+use beech_core::thrift::protocol::verify_expected_message_type;
+use beech_core::thrift::protocol::verify_expected_sequence_number;
+use beech_core::thrift::protocol::verify_expected_service_call;
+use beech_core::thrift::protocol::verify_required_field_exists;
+use beech_core::thrift::protocol::{
     TFieldIdentifier, TInputProtocol, TListIdentifier, TMapIdentifier, TMessageIdentifier, TMessageType,
     TOutputProtocol, TSerializable, TSetIdentifier, TStructIdentifier, TType,
 };
-use thrift::{ApplicationError, ApplicationErrorKind, ProtocolError, ProtocolErrorKind, TThriftClient};
+use beech_core::thrift::{
+    ApplicationError, ApplicationErrorKind, ProtocolError, ProtocolErrorKind, TThriftClient,
+};
 
 //
 // SearchSlot
@@ -56,7 +58,7 @@ impl SearchSlot {
 }
 
 impl TSerializable for SearchSlot {
-    fn read_from_in_protocol(i_prot: &mut dyn TInputProtocol) -> thrift::Result<SearchSlot> {
+    fn read_from_in_protocol(i_prot: &mut dyn TInputProtocol) -> beech_core::thrift::Result<SearchSlot> {
         i_prot.read_struct_begin()?;
         let mut f_1: Option<i32> = None;
         let mut f_2: Option<i32> = None;
@@ -105,7 +107,7 @@ impl TSerializable for SearchSlot {
         };
         Ok(ret)
     }
-    fn write_to_out_protocol(&self, o_prot: &mut dyn TOutputProtocol) -> thrift::Result<()> {
+    fn write_to_out_protocol(&self, o_prot: &mut dyn TOutputProtocol) -> beech_core::thrift::Result<()> {
         let struct_ident = TStructIdentifier::new("SearchSlot");
         o_prot.write_struct_begin(&struct_ident)?;
         o_prot.write_field_begin(&TFieldIdentifier::new("key_part", TType::I32, 1))?;
@@ -136,6 +138,7 @@ pub struct AccessPlan {
     pub preserves_order: bool,
     pub estimated_cost: OrderedFloat<f64>,
     pub estimated_rows: i64,
+    pub projection: Vec<i32>,
 }
 
 impl AccessPlan {
@@ -145,6 +148,7 @@ impl AccessPlan {
         preserves_order: bool,
         estimated_cost: OrderedFloat<f64>,
         estimated_rows: i64,
+        projection: Vec<i32>,
     ) -> AccessPlan {
         AccessPlan {
             table_id,
@@ -152,18 +156,20 @@ impl AccessPlan {
             preserves_order,
             estimated_cost,
             estimated_rows,
+            projection,
         }
     }
 }
 
 impl TSerializable for AccessPlan {
-    fn read_from_in_protocol(i_prot: &mut dyn TInputProtocol) -> thrift::Result<AccessPlan> {
+    fn read_from_in_protocol(i_prot: &mut dyn TInputProtocol) -> beech_core::thrift::Result<AccessPlan> {
         i_prot.read_struct_begin()?;
         let mut f_1: Option<Vec<u8>> = None;
         let mut f_2: Option<Vec<SearchSlot>> = None;
         let mut f_3: Option<bool> = None;
         let mut f_4: Option<OrderedFloat<f64>> = None;
         let mut f_5: Option<i64> = None;
+        let mut f_6: Option<Vec<i32>> = None;
         loop {
             let field_ident = i_prot.read_field_begin()?;
             if field_ident.field_type == TType::Stop {
@@ -197,6 +203,16 @@ impl TSerializable for AccessPlan {
                     let val = i_prot.read_i64()?;
                     f_5 = Some(val);
                 }
+                6 => {
+                    let list_ident = i_prot.read_list_begin()?;
+                    let mut val: Vec<i32> = Vec::with_capacity(list_ident.size as usize);
+                    for _ in 0..list_ident.size {
+                        let list_elem_1 = i_prot.read_i32()?;
+                        val.push(list_elem_1);
+                    }
+                    i_prot.read_list_end()?;
+                    f_6 = Some(val);
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
                 }
@@ -209,6 +225,7 @@ impl TSerializable for AccessPlan {
         verify_required_field_exists("AccessPlan.preserves_order", &f_3)?;
         verify_required_field_exists("AccessPlan.estimated_cost", &f_4)?;
         verify_required_field_exists("AccessPlan.estimated_rows", &f_5)?;
+        verify_required_field_exists("AccessPlan.projection", &f_6)?;
         let ret = AccessPlan {
             table_id: f_1.expect("auto-generated code should have checked for presence of required fields"),
             search: f_2.expect("auto-generated code should have checked for presence of required fields"),
@@ -218,10 +235,12 @@ impl TSerializable for AccessPlan {
                 .expect("auto-generated code should have checked for presence of required fields"),
             estimated_rows: f_5
                 .expect("auto-generated code should have checked for presence of required fields"),
+            projection: f_6
+                .expect("auto-generated code should have checked for presence of required fields"),
         };
         Ok(ret)
     }
-    fn write_to_out_protocol(&self, o_prot: &mut dyn TOutputProtocol) -> thrift::Result<()> {
+    fn write_to_out_protocol(&self, o_prot: &mut dyn TOutputProtocol) -> beech_core::thrift::Result<()> {
         let struct_ident = TStructIdentifier::new("AccessPlan");
         o_prot.write_struct_begin(&struct_ident)?;
         o_prot.write_field_begin(&TFieldIdentifier::new("table_id", TType::String, 1))?;
@@ -242,6 +261,13 @@ impl TSerializable for AccessPlan {
         o_prot.write_field_end()?;
         o_prot.write_field_begin(&TFieldIdentifier::new("estimated_rows", TType::I64, 5))?;
         o_prot.write_i64(self.estimated_rows)?;
+        o_prot.write_field_end()?;
+        o_prot.write_field_begin(&TFieldIdentifier::new("projection", TType::List, 6))?;
+        o_prot.write_list_begin(&TListIdentifier::new(TType::I32, self.projection.len() as i32))?;
+        for e in &self.projection {
+            o_prot.write_i32(*e)?;
+        }
+        o_prot.write_list_end()?;
         o_prot.write_field_end()?;
         o_prot.write_field_stop()?;
         o_prot.write_struct_end()

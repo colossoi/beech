@@ -8,11 +8,14 @@ fn order_by_key_asc_consumed() {
     let conn = setup_vtab(tmp.path(), "t", "tt");
 
     // ORDER BY k ASC should be consumed by the vtab (no sort step).
-    let plan: String = conn
-        .query_row("EXPLAIN QUERY PLAN SELECT k FROM tt ORDER BY k ASC", [], |r| {
-            r.get(3)
-        })
-        .unwrap();
+    let plan = conn
+        .prepare("EXPLAIN QUERY PLAN SELECT k FROM tt ORDER BY k ASC")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+        .join("\n");
     // If the vtab consumed the ORDER BY, SQLite should NOT show "USE TEMP
     // B-TREE FOR ORDER BY" in the plan output.
     assert!(

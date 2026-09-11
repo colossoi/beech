@@ -10,6 +10,7 @@ $source = Get-Content -Raw -LiteralPath $outputPath
 # Thrift server feature. The old rustfmt attribute is unsupported by modern Rust.
 $source = [regex]::Replace($source, '(?m)^use thrift::server::TProcessor;\r?\n', '')
 $source = [regex]::Replace($source, '(?m)^#!\[cfg_attr\(rustfmt, rustfmt_skip\)\]\r?\n', '')
+$source = $source.Replace('thrift::', 'beech_core::thrift::')
 Set-Content -LiteralPath $outputPath -Value $source -NoNewline
 rustfmt --edition 2024 $outputPath
 if ($LASTEXITCODE -ne 0) { throw 'Formatting generated Rust failed' }

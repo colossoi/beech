@@ -1,10 +1,7 @@
 mod common;
 use common::*;
 
-// BUG: WHERE a = 2 AND b = 1 on a two-part key returns the first row
-// matching the prefix (b=0) instead of the exact match (b=1).
 #[test]
-#[ignore]
 fn two_part_key_round_trip() {
     let rows: Vec<_> = (0..5)
         .flat_map(|a| {

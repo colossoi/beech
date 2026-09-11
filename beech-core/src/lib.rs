@@ -5,6 +5,8 @@ use crate::error::{bail, beech_error};
 pub use arrow_array::RecordBatch;
 pub use arrow_schema::{DataType, Field};
 use std::{collections::BTreeMap, sync::Arc, time::SystemTime};
+/// The Thrift runtime used by Beech codecs, shared with adapter codecs.
+pub use thrift;
 pub mod codec;
 mod decimal;
 #[cfg(test)]

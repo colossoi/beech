@@ -1,9 +1,7 @@
 mod common;
 use common::*;
 
-// BUG: missing root file does not surface as an error through execute_batch.
 #[test]
-#[ignore]
 fn missing_root_file_surfaces_error() {
     let tmp = tempfile::TempDir::new().unwrap();
     // No tree written — root file doesn't exist.
@@ -17,9 +15,7 @@ fn missing_root_file_surfaces_error() {
     assert!(result.is_err(), "should fail with missing root file");
 }
 
-// BUG: wrong table name does not surface as an error through execute_batch.
 #[test]
-#[ignore]
 fn missing_table_in_transaction_surfaces_not_found() {
     let rows: Vec<_> = (0..5).map(|i| int_row(i, i as i32)).collect();
     let tmp = make_test_tree(rows, vec![0], "t");
@@ -32,4 +28,23 @@ fn missing_table_in_transaction_surfaces_not_found() {
     );
     let result = conn.execute_batch(&sql);
     assert!(result.is_err(), "should fail when table name doesn't match");
+}
+
+#[test]
+fn missing_leaf_surfaces_its_id_during_query() {
+    use beech_core::{
+        Id,
+        storage::{FileStore, Repository},
+    };
+    use std::sync::Arc;
+
+    let tmp = make_test_tree((0..5).map(|i| int_row(i, i as i32)).collect(), vec![0], "t");
+    let conn = setup_vtab(tmp.path(), "t", "tt");
+    let repository = Arc::new(Repository::new(FileStore::new(tmp.path())));
+    let root_id = Id::from_hex(std::fs::read_to_string(tmp.path().join("root")).unwrap().trim()).unwrap();
+    let table = repository.snapshot(root_id).unwrap().table("t").unwrap();
+    let leaf_id = table.root().unwrap().id();
+    std::fs::remove_file(tmp.path().join(leaf_id.to_string())).unwrap();
+    let error = conn.query_row("SELECT k FROM tt", [], |r| r.get::<_, i32>(0)).unwrap_err();
+    assert!(error.to_string().contains(&leaf_id.to_string()), "{error}");
 }
