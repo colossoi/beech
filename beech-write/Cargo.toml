@@ -6,6 +6,6 @@ edition = "2021"
 [dependencies]
 beech-core = { path = "../beech-core" }
 beech-shaper = { path = "../beech-shaper" }
-itertools = "0.14.0"
-sha2 = "0.10.9"
+arrow-array = "=59.3.0"
 
+tempfile = "3"

@@ -1,4 +1,4 @@
-use apache_avro::Schema;
+use beech_core::Field;
 use std::str::FromStr;
 
 #[derive(Debug, Clone)]
@@ -40,27 +40,17 @@ impl FromStr for KeyColumns {
 }
 
 impl KeyColumns {
-    pub fn to_indices(&self, schema: &Schema) -> anyhow::Result<Vec<usize>> {
-        if let Schema::Record(record_schema) = schema {
-            self.columns
-                .iter()
-                .map(|col| match col {
-                    KeyColumn::Index(idx) => {
-                        if *idx < record_schema.fields.len() {
-                            Ok(*idx)
-                        } else {
-                            Err(anyhow::anyhow!("Column index {} out of range", idx))
-                        }
-                    }
-                    KeyColumn::Name(name) => record_schema
-                        .fields
-                        .iter()
-                        .position(|field| field.name == *name)
-                        .ok_or_else(|| anyhow::anyhow!("Column '{}' not found", name)),
-                })
-                .collect()
-        } else {
-            Err(anyhow::anyhow!("Expected record schema"))
-        }
+    pub fn to_indices(&self, fields: &[Field]) -> anyhow::Result<Vec<usize>> {
+        self.columns
+            .iter()
+            .map(|col| match col {
+                KeyColumn::Index(index) if *index < fields.len() => Ok(*index),
+                KeyColumn::Index(index) => Err(anyhow::anyhow!("Column index {index} out of range")),
+                KeyColumn::Name(name) => fields
+                    .iter()
+                    .position(|f| f.name() == name)
+                    .ok_or_else(|| anyhow::anyhow!("Column '{name}' not found")),
+            })
+            .collect()
     }
 }

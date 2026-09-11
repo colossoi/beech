@@ -60,7 +60,8 @@ impl TableSchema {
             self.fields.fields().get(col).ok_or_else(|| beech_error!(Schema, "column out of bounds"))?;
         value.validate_type(field.data_type(), field.is_nullable())
     }
-    pub(crate) fn validate_key(&self, key: &Key, prefix: bool) -> Result<()> {
+    /// Validate a full key, or a nonempty prefix when `prefix` is true.
+    pub fn validate_key(&self, key: &Key, prefix: bool) -> Result<()> {
         if key.is_empty()
             || key.len() > self.key_columns.len()
             || (!prefix && key.len() != self.key_columns.len())

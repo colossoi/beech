@@ -1,186 +1,127 @@
-//! In-memory test fixtures for beech.
-//!
-//! `MemoryStore` is a paired `MemoryWriter` + `MemoryNodeSource` over a
-//! shared `Arc<Mutex<HashMap<String, Vec<u8>>>>`. Bytes written via the
-//! writer become readable through the node source — useful for round-trip
-//! tests of the write+read pipeline without touching the filesystem.
-//!
-//! `build_simple_table` is the all-in-one helper: build a tree from a
-//! `(row_id, record)` list and hand back a node source plus the resolved
-//! `Table` snapshot, ready for cursor or query exercises.
-
-use std::collections::HashMap;
-use std::io::Cursor;
-use std::path::Path;
-use std::sync::{Arc, Mutex};
-
-use apache_avro::types::Value;
-use beech_core::wire::{decode_node, decode_root, decode_table, decode_transaction};
+//! Transactional in-memory storage for writer and reader integration tests.
 use beech_core::{
-    DomainError, Id, Node, NodeSource, Result, Root, StorageError, Table, TableSchema, Transaction,
+    storage::{BackingStore, ObjectFile, Repository},
+    BeechError, Id, Result, Row, Table, TableSchema,
+};
+use beech_write::{BuildOptions, ObjectSink, Writer};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
 };
 
 type Files = Arc<Mutex<HashMap<String, Vec<u8>>>>;
-
-/// Shared in-memory backing store. Construct one, then call [`Self::writer`]
-/// and [`Self::node_source`] as many times as needed; they all reference the
-/// same underlying map.
 #[derive(Clone, Default)]
 pub struct MemoryStore {
     files: Files,
 }
-
+pub type MemoryNodeSource = Repository;
 impl MemoryStore {
     pub fn new() -> Self {
         Self::default()
     }
-
     pub fn writer(&self) -> MemoryWriter {
         MemoryWriter {
-            files: Arc::clone(&self.files),
+            files: self.files.clone(),
+            pending: HashMap::new(),
         }
     }
-
-    pub fn node_source(&self) -> MemoryNodeSource {
-        MemoryNodeSource {
-            files: Arc::clone(&self.files),
-        }
+    pub fn node_source(&self) -> Repository {
+        Repository::with_options(
+            self.clone(),
+            beech_core::storage::RepositoryOptions {
+                verify_leaves: true,
+                ..Default::default()
+            },
+        )
     }
-
-    /// Number of files currently in the store.
     pub fn file_count(&self) -> usize {
         self.files.lock().unwrap().len()
     }
-
-    /// Raw access to a stored file by name (e.g. `"<id>.bch"` or `"root.bch"`).
     pub fn get(&self, name: &str) -> Option<Vec<u8>> {
         self.files.lock().unwrap().get(name).cloned()
     }
-
-    /// Raw insert. Useful for tests that want to corrupt the store.
+    /// Raw mutation for corruption tests only.
     pub fn insert(&self, name: impl Into<String>, bytes: Vec<u8>) {
         self.files.lock().unwrap().insert(name.into(), bytes);
     }
-
-    /// Remove a file. Useful for tests that simulate missing-file scenarios.
     pub fn remove(&self, name: &str) -> Option<Vec<u8>> {
         self.files.lock().unwrap().remove(name)
     }
 }
-
+impl BackingStore for MemoryStore {
+    fn get(&self, id: &Id) -> Result<ObjectFile> {
+        self.get(&id.to_string()).map(|b| ObjectFile::from_bytes(b.into())).ok_or(BeechError::NotFound(*id))
+    }
+}
 pub struct MemoryWriter {
     files: Files,
+    pending: HashMap<String, Vec<u8>>,
 }
-
-impl beech_write::Writer for MemoryWriter {
-    fn write<P>(&mut self, name: P, data: &[u8]) -> std::io::Result<()>
-    where
-        P: AsRef<Path>,
-    {
-        let filename = name.as_ref().to_string_lossy().to_string();
-        self.files.lock().unwrap().insert(filename, data.to_vec());
+impl ObjectSink for MemoryWriter {
+    fn put(&mut self, id: Id, bytes: &[u8]) -> std::io::Result<()> {
+        let name = id.to_string();
+        if let Some(old) =
+            self.pending.get(&name).cloned().or_else(|| self.files.lock().unwrap().get(&name).cloned())
+        {
+            if old != bytes {
+                return Err(std::io::Error::other("cannot replace immutable object"));
+            }
+        }
+        self.pending.insert(name, bytes.to_vec());
         Ok(())
     }
-
+}
+impl Writer for MemoryWriter {
+    fn stage_root(&mut self, root_id: Id) -> std::io::Result<()> {
+        let name = root_id.to_string();
+        if !self.pending.contains_key(&name) && !self.files.lock().unwrap().contains_key(&name) {
+            return Err(std::io::Error::other("root object is not available"));
+        }
+        self.pending.insert("root".into(), name.into_bytes());
+        Ok(())
+    }
     fn commit(self) -> std::io::Result<()> {
+        let mut files = self.files.lock().unwrap();
+        for (name, bytes) in &self.pending {
+            if name != "root" && files.get(name).is_some_and(|old| old != bytes) {
+                return Err(std::io::Error::other("cannot replace immutable object"));
+            }
+        }
+        files.extend(self.pending);
         Ok(())
     }
-
     fn abort(self) -> std::io::Result<()> {
         Ok(())
     }
-
     fn num_to_commit(&self) -> usize {
-        self.files.lock().unwrap().len()
+        self.pending.len()
     }
 }
 
-pub struct MemoryNodeSource {
-    files: Files,
-}
-
-impl MemoryNodeSource {
-    fn get_file_data(&self, id: &Id) -> Result<Vec<u8>> {
-        let filename = format!("{id}.bch");
-        self.files
-            .lock()
-            .unwrap()
-            .get(&filename)
-            .cloned()
-            .ok_or_else(|| StorageError::key_not_found("file", id.clone()).into())
-    }
-}
-
-impl beech_core::NodeSource for MemoryNodeSource {
-    fn get_root(&self) -> Result<Arc<Root>> {
-        let files = self.files.lock().unwrap();
-        if let Some(data) = files.get("root.bch") {
-            let mut cursor = Cursor::new(data.clone());
-            drop(files);
-            Ok(Arc::new(decode_root(&mut cursor)?))
-        } else {
-            Err(StorageError::key_not_found("root", Default::default()).into())
-        }
-    }
-
-    fn get_transaction(&self, transaction_id: &Id) -> Result<Arc<Transaction>> {
-        let data = self.get_file_data(transaction_id)?;
-        let mut cursor = Cursor::new(data);
-        Ok(Arc::new(decode_transaction(&mut cursor)?))
-    }
-
-    fn get_table(&self, transaction: &Transaction, table_name: &str) -> Result<Arc<Table>> {
-        if let Some(table_id) = transaction.tables.get(table_name) {
-            let data = self.get_file_data(table_id)?;
-            let mut cursor = Cursor::new(data);
-            Ok(Arc::new(decode_table(&mut cursor)?))
-        } else {
-            Err(DomainError::NoSuchTable {
-                name: table_name.to_string(),
-            }
-            .into())
-        }
-    }
-
-    fn get_node(&self, node_id: &Id, schema: &TableSchema) -> Result<Arc<Node>> {
-        let data = self.get_file_data(node_id)?;
-        let mut cursor = Cursor::new(data);
-        Ok(Arc::new(decode_node(&mut cursor, schema)?))
-    }
-}
-
-/// Build a fresh prolly tree in memory from `(row_id, record)` pairs.
-///
-/// Returns the populated `MemoryStore`, a `MemoryNodeSource` view into it,
-/// and the resolved `Table` snapshot — ready to feed a `Cursor` or any
-/// other code that wants a built table to read against.
-///
-/// `key_columns` lists row-column indices that participate in the key.
-/// `target_node_size` controls the prolly-tree split target.
 pub fn build_simple_table(
-    table_name: &str,
-    rows: Vec<(i64, Value)>,
-    key_columns: Vec<usize>,
-    target_node_size: usize,
-    node_size_stddev: usize,
+    name: &str,
+    rows: Vec<Row>,
+    schema: TableSchema,
+    target: usize,
+    stddev: usize,
 ) -> Result<(MemoryStore, MemoryNodeSource, Arc<Table>)> {
     let store = MemoryStore::new();
     let mut writer = store.writer();
-    let (transaction_id, _table_id) = beech_write::write_rows_to_prolly_tree(
+    let table = beech_write::build_table(
         &mut writer,
-        table_name.to_string(),
-        key_columns,
+        name.into(),
+        schema,
         rows,
-        target_node_size,
-        node_size_stddev,
-        None,
+        BuildOptions::new(target, stddev)?,
     )?;
-    // Persist the root pointer just like beech-cli's load_csv does.
-    let root_bytes = transaction_id.to_string();
-    store.insert("root", root_bytes.into_bytes());
-
-    let node_source = store.node_source();
-    let transaction = node_source.get_transaction(&transaction_id)?;
-    let table = node_source.get_table(&transaction, table_name)?;
-    Ok((store, node_source, table))
+    let publication = beech_write::publish_table(&mut writer, &table, Default::default(), None)?;
+    writer.commit()?;
+    let source = store.node_source();
+    let table = source.table_by_id(&publication.table_id)?;
+    // Also exercise the published root and transaction chain.
+    let root = source.get_root(&publication.root_id)?;
+    assert_eq!(root.transaction_id(), publication.transaction_id);
+    let transaction = source.get_transaction(&root.transaction_id())?;
+    source.get_table(&transaction, name)?;
+    Ok((store, source, table))
 }

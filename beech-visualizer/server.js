@@ -129,8 +129,8 @@ app.get('/api/tree-structure', async (req, res) => {
       });
       
       // Build tree for this table's root page
-      if (table.root_page) {
-        await buildTreeNodes(table.root_page, nodes, edges, tableX, 300, table.name, tableNodeId, 0);
+      if (table.root_node) {
+        await buildTreeNodes(table.root_node, nodes, edges, tableX, 300, table.name, tableNodeId, 0);
       }
       
       tableX += 300;
@@ -154,9 +154,9 @@ async function buildTreeNodes(pageId, nodes, edges, x, y, tableName, parentId = 
       type: 'custom',
       position: { x: x, y: y },
       data: {
-        label: `${pageInfo.page_type} Page`,
+        label: `${pageInfo.node_type} Page`,
         pageId: pageId.substring(0, 8) + '...',
-        pageType: pageInfo.page_type,
+        pageType: pageInfo.node_type,
         numKeys: pageInfo.num_keys,
         numRows: pageInfo.num_rows,
         tableName: level === 0 ? tableName : undefined

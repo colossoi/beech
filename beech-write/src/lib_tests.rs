@@ -1,132 +1,178 @@
-#![allow(unused_imports)]
 use super::*;
-use apache_avro::types::Value;
-use beech_core::{BeechError, DomainError, SchemaError};
-use std::path::Path;
-
-// Minimal in-crate Writer for tests that just need to exercise error paths.
-struct NoopWriter {
-    num: usize,
+use beech_core::{
+    codec,
+    query::RowCursor,
+    storage::{FileStore, Repository},
+    DataType, Field, Scalar, TableSchema,
+};
+use std::{collections::BTreeMap, fs, sync::Arc};
+fn schema() -> TableSchema {
+    TableSchema::new(vec![Field::new("k", DataType::Int64, false)], vec![0]).unwrap()
 }
-impl NoopWriter {
-    fn new() -> Self {
-        Self { num: 0 }
+fn rows() -> Vec<beech_core::Row> {
+    vec![(1, vec![Scalar::Int64(1)]), (2, vec![Scalar::Int64(2)])]
+}
+fn publish(dir: &std::path::Path) -> Publication {
+    let mut writer = FileWriter::new(dir).unwrap();
+    let table = build_table(&mut writer, "t".into(), schema(), rows(), BuildOptions::default()).unwrap();
+    let publication = publish_table(&mut writer, &table, BTreeMap::new(), None).unwrap();
+    writer.commit().unwrap();
+    publication
+}
+#[test]
+fn validation_happens_before_staging() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut w = FileWriter::new(dir.path()).unwrap();
+    assert!(BuildOptions::new(0, 1).is_err());
+    assert!(BuildOptions::new(1, 0).is_err());
+    for rows in [
+        vec![(1, vec![Scalar::Utf8("bad".into())])],
+        vec![(1, vec![Scalar::Int64(1)]), (2, vec![Scalar::Int64(1)])],
+    ] {
+        assert!(build_table(&mut w, "t".into(), schema(), rows, BuildOptions::default()).is_err());
+        assert_eq!(w.num_to_commit(), 0);
     }
 }
-impl Writer for NoopWriter {
-    fn write<P: AsRef<Path>>(&mut self, _name: P, _data: &[u8]) -> std::io::Result<()> {
-        self.num += 1;
-        Ok(())
-    }
-    fn commit(self) -> std::io::Result<()> {
-        Ok(())
-    }
-    fn abort(self) -> std::io::Result<()> {
-        Ok(())
-    }
-    fn num_to_commit(&self) -> usize {
-        self.num
+#[test]
+fn publish_reopens_root_and_parquet_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let publication = publish(dir.path());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("root")).unwrap(),
+        publication.root_id.to_string()
+    );
+    let repository = Arc::new(Repository::new(FileStore::new(dir.path())));
+    let snapshot = repository.snapshot(publication.root_id).unwrap();
+    let table = snapshot.table("t").unwrap();
+    assert_eq!(
+        RowCursor::new(&snapshot, &table, vec![]).unwrap().collect::<beech_core::Result<Vec<_>>>().unwrap(),
+        rows()
+    );
+    let bytes = fs::read(dir.path().join(table.root().unwrap().id().to_string())).unwrap();
+    assert_eq!(&bytes[..4], b"PAR1");
+}
+#[test]
+fn abort_and_drop_preserve_committed_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = publish(dir.path());
+    let original = fs::read(dir.path().join("root")).unwrap();
+    for explicit_abort in [true, false] {
+        let mut w = FileWriter::new(dir.path()).unwrap();
+        let table = build_table(&mut w, "t".into(), schema(), vec![], BuildOptions::default()).unwrap();
+        let next = publish_table(&mut w, &table, BTreeMap::new(), Some(first.transaction_id)).unwrap();
+        assert_eq!(fs::read(dir.path().join("root")).unwrap(), original);
+        if explicit_abort {
+            w.abort().unwrap();
+        } else {
+            drop(w);
+        }
+        assert_eq!(fs::read(dir.path().join("root")).unwrap(), original);
+        assert!(!dir.path().join(next.root_id.to_string()).exists());
+        assert!(dir.path().join(first.root_id.to_string()).exists());
     }
 }
-
-fn int_record(k: i32, v: i32) -> Value {
-    Value::Record(vec![
-        ("k".to_string(), Value::Int(k)),
-        ("v".to_string(), Value::Int(v)),
-    ])
+#[test]
+fn reusing_objects_never_stages_overwrites_or_deletes_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = publish(dir.path());
+    let original = fs::read(dir.path().join(first.root_id.to_string())).unwrap();
+    let mut w = FileWriter::new(dir.path()).unwrap();
+    w.put(first.root_id, &original).unwrap();
+    w.put(first.root_id, &original).unwrap();
+    assert_eq!(w.num_to_commit(), 0);
+    w.abort().unwrap();
+    assert_eq!(
+        fs::read(dir.path().join(first.root_id.to_string())).unwrap(),
+        original
+    );
 }
-
-// --- infer_row_schema_from_record -----------------------------------
+#[test]
+fn failed_commit_preserves_root() {
+    let dir = tempfile::tempdir().unwrap();
+    publish(dir.path());
+    let original = fs::read(dir.path().join("root")).unwrap();
+    let mut w = FileWriter::new(dir.path()).unwrap();
+    let table = build_table(&mut w, "other".into(), schema(), rows(), BuildOptions::default()).unwrap();
+    let next = publish_table(&mut w, &table, BTreeMap::new(), None).unwrap();
+    // A directory cannot be reused as an object if it appears after staging.
+    fs::create_dir(dir.path().join(next.table_id.to_string())).unwrap();
+    assert!(w.commit().is_err());
+    assert_eq!(fs::read(dir.path().join("root")).unwrap(), original);
+    assert!(dir.path().join(next.table_id.to_string()).is_dir());
+}
+#[test]
+fn writer_lock_is_exclusive_and_released_on_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let w = FileWriter::new(dir.path()).unwrap();
+    assert!(FileWriter::new(dir.path()).is_err());
+    drop(w);
+    FileWriter::new(dir.path()).unwrap();
+}
+#[test]
+fn snapshot_replacement_retains_other_tables_and_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = publish(dir.path());
+    let mut w = FileWriter::new(dir.path()).unwrap();
+    let repository = Repository::new(FileStore::new(dir.path()));
+    let previous = repository.get_transaction(&first.transaction_id).unwrap();
+    let table = build_table(&mut w, "other".into(), schema(), vec![], BuildOptions::default()).unwrap();
+    let second = publish_table(
+        &mut w,
+        &table,
+        previous.tables().clone(),
+        Some(first.transaction_id),
+    )
+    .unwrap();
+    w.commit().unwrap();
+    let next = repository.get_transaction(&second.transaction_id).unwrap();
+    assert_eq!(next.tables().len(), 2);
+    assert_eq!(next.previous_id(), first.transaction_id);
+    assert_eq!(
+        repository.get_table(&next, "t").unwrap().root().unwrap().row_count(),
+        2
+    );
+    assert!(repository.get_table(&next, "other").unwrap().root().is_none());
+}
+#[test]
+fn cannot_stage_missing_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut w = FileWriter::new(dir.path()).unwrap();
+    let root = codec::thrift::encode_root(&beech_core::Root::new(Id::default())).unwrap();
+    assert!(w.stage_root(root.id()).is_err());
+    w.put(root.id(), root.bytes()).unwrap();
+    w.stage_root(root.id()).unwrap();
+}
 
 #[test]
-fn infer_row_schema_supported_types() {
-    let rec = Value::Record(vec![
-        ("a".to_string(), Value::Int(1)),
-        ("b".to_string(), Value::Long(2)),
-        ("c".to_string(), Value::String("x".to_string())),
-        ("d".to_string(), Value::Double(1.5)),
-        ("e".to_string(), Value::Float(1.5)),
-        ("f".to_string(), Value::Boolean(true)),
-        ("g".to_string(), Value::Bytes(vec![0, 1, 2])),
-    ]);
-    let schema = infer_row_schema_from_record(&rec).unwrap();
-    // Round-trip through to_string to make sure it's a valid record schema.
-    let s = schema.canonical_form();
-    assert!(s.contains(r#""name":"a""#));
-    assert!(s.contains(r#""name":"g""#));
+fn commit_reuses_object_that_appeared_after_staging() {
+    let dir = tempfile::tempdir().unwrap();
+    let object = codec::thrift::encode_root(&beech_core::Root::new(Id::default())).unwrap();
+    let mut writer = FileWriter::new(dir.path()).unwrap();
+    writer.put(object.id(), object.bytes()).unwrap();
+    writer.put(object.id(), object.bytes()).unwrap();
+    assert_eq!(writer.num_to_commit(), 1);
+    assert!(!dir.path().join(object.id().to_string()).exists());
+    fs::write(dir.path().join(object.id().to_string()), object.bytes()).unwrap();
+    writer.commit().unwrap();
+    assert_eq!(
+        fs::read(dir.path().join(object.id().to_string())).unwrap(),
+        object.bytes().as_ref()
+    );
 }
 
+#[cfg(unix)]
 #[test]
-fn infer_row_schema_rejects_unsupported() {
-    let rec = Value::Record(vec![("xs".to_string(), Value::Array(vec![Value::Int(1)]))]);
-    let err = infer_row_schema_from_record(&rec).unwrap_err();
-    match err {
-        BeechError::Schema(SchemaError::UnsupportedFieldType { .. }) => (),
-        other => panic!("unexpected error: {:?}", other),
-    }
-}
-
-// --- write_rows_to_prolly_tree error paths -------------------------
-
-#[test]
-fn write_rejects_empty_input() {
-    let mut w = NoopWriter::new();
-    let err =
-        write_rows_to_prolly_tree(&mut w, "t".to_string(), vec![0], vec![], 64, 16, None).unwrap_err();
-    match err {
-        BeechError::Domain(DomainError::InvalidArgs(_)) => (),
-        other => panic!("expected InvalidArgs, got {:?}", other),
-    }
-}
-
-#[test]
-fn write_rejects_unsupported_field_type() {
-    let mut w = NoopWriter::new();
-    let rows = vec![(
-        1i64,
-        Value::Record(vec![
-            ("k".to_string(), Value::Int(1)),
-            ("xs".to_string(), Value::Array(vec![Value::Int(1)])),
-        ]),
-    )];
-    let err = write_rows_to_prolly_tree(&mut w, "t".to_string(), vec![0], rows, 64, 16, None).unwrap_err();
-    match err {
-        BeechError::Schema(SchemaError::UnsupportedFieldType { .. }) => (),
-        other => panic!("expected UnsupportedFieldType, got {:?}", other),
-    }
-}
-
-#[test]
-fn write_rejects_duplicate_keys_in_input() {
-    let mut w = NoopWriter::new();
-    let rows = vec![
-        (1i64, int_record(5, 10)),
-        (2i64, int_record(5, 20)), // same key
-    ];
-    let err = write_rows_to_prolly_tree(&mut w, "t".to_string(), vec![0], rows, 64, 16, None).unwrap_err();
-    match err {
-        BeechError::Domain(DomainError::DuplicateKey { .. }) => (),
-        other => panic!("expected DuplicateKey, got {:?}", other),
-    }
-}
-
-// --- Change key accessor -------------------------------------------
-
-#[test]
-fn change_key_accessor_returns_key() {
-    let k = vec![Value::Int(42)];
-    let ins = Change::Insert {
-        key: k.clone(),
-        row_id: 1,
-        record: vec![Value::Int(42), Value::Int(0)],
-    };
-    let upd = Change::Update {
-        key: k.clone(),
-        row_id: 1,
-        record: vec![Value::Int(42), Value::Int(9)],
-    };
-    let del = Change::Delete { key: k.clone() };
-    assert_eq!(ins.key(), &k);
-    assert_eq!(upd.key(), &k);
-    assert_eq!(del.key(), &k);
+fn reuse_does_not_require_reading_existing_object_contents() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let object = codec::thrift::encode_root(&beech_core::Root::new(Id::default())).unwrap();
+    let path = dir.path().join(object.id().to_string());
+    fs::write(&path, object.bytes()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    let mut writer = FileWriter::new(dir.path()).unwrap();
+    writer.put(object.id(), object.bytes()).unwrap();
+    assert_eq!(writer.num_to_commit(), 0);
+    writer.commit().unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(fs::read(path).unwrap(), object.bytes().as_ref());
 }

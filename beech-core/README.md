@@ -4,8 +4,10 @@ A content-addressed prolly tree with column-oriented Parquet leaves and Thrift
 Compact Protocol metadata. Each leaf contains exactly one row group. The tree
 builder determines leaf boundaries.
 
-This migration currently covers core and the SQLite adapter. The writer, CLI, and
-shared fixtures still need migration. The previous storage format is incompatible.
+Core, the writer, CLI, SQLite adapter, and shared fixtures use this format.
+The previous Avro storage format is incompatible; old data must be reimported.
+See [the writer](../beech-write/README.md) for construction and publication APIs
+and [the CLI](../beech-cli/README.md) for CSV imports.
 
 ## Layout
 
