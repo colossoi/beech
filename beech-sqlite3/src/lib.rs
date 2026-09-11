@@ -15,26 +15,28 @@
 //! SELECT * FROM my_table WHERE id > 100;
 //! ```
 
-use apache_avro::{AvroSchema, Schema};
-use beech_core::plan::{AccessPlan, CandidateConstraint};
+use apache_avro::Schema;
+use beech_core::plan::CandidateConstraint;
 use beech_core::query::{Constraint, ConstraintOp};
 use beech_core::{
     BeechError, Column, DomainError, Id, NodeSource, QueryError, SchemaError, StorageError, Table,
     WireError,
 };
 use log::debug;
+use plan::AccessPlan;
 use rusqlite::Result;
 use rusqlite::ffi::ErrorCode;
 use rusqlite::types::ValueRef;
 use rusqlite::vtab::{
-    Context, CreateVTab, Filters, IndexConstraintOp, IndexInfo, VTab, VTabConnection, VTabCursor,
-    VTabKind, read_only_module, sqlite3_vtab, sqlite3_vtab_cursor,
+    Context, CreateVTab, Filters, IndexConstraintOp, IndexInfo, VTab, VTabConnection, VTabCursor, VTabKind,
+    read_only_module, sqlite3_vtab, sqlite3_vtab_cursor,
 };
 use std::collections::HashMap;
 use std::ffi::c_int;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod plan;
 mod store;
 
 #[repr(C)]
@@ -43,7 +45,7 @@ struct BeechTable {
     remote_table_name: String,
     source: Arc<dyn NodeSource>,
     data_path: PathBuf,
-    /// Snapshot of the table and total row count, captured at connect
+    /// Snapshot of the table and its object ID, captured at connect
     /// time. Safe to hold for the vtab's lifetime: nodes, tables, and
     /// transactions are content-addressed and immutable; only the root
     /// file is mutable. A vtab that snapshots at connect keeps serving
@@ -53,8 +55,7 @@ struct BeechTable {
 
 struct TableMeta {
     table: Arc<Table>,
-    /// `root.subtree_row_count` if the table has a root, else 0.
-    total_rows: i64,
+    table_id: Id,
 }
 fn avro_type_to_sqlite_type(typ: &Schema) -> &str {
     use apache_avro::Schema::*;
@@ -121,12 +122,10 @@ fn from_hex(hex: &str) -> beech_core::Result<Vec<u8>> {
 
     let mut out = Vec::with_capacity(bytes.len() / 2);
     for i in (0..bytes.len()).step_by(2) {
-        let high = decode_nibble(bytes[i]).ok_or_else(|| {
-            WireError::InvalidHex(format!("invalid digit: {:?}", bytes[i] as char))
-        })?;
-        let low = decode_nibble(bytes[i + 1]).ok_or_else(|| {
-            WireError::InvalidHex(format!("invalid digit: {:?}", bytes[i + 1] as char))
-        })?;
+        let high = decode_nibble(bytes[i])
+            .ok_or_else(|| WireError::InvalidHex(format!("invalid digit: {:?}", bytes[i] as char)))?;
+        let low = decode_nibble(bytes[i + 1])
+            .ok_or_else(|| WireError::InvalidHex(format!("invalid digit: {:?}", bytes[i + 1] as char)))?;
         out.push((high << 4) | low);
     }
     Ok(out)
@@ -134,16 +133,11 @@ fn from_hex(hex: &str) -> beech_core::Result<Vec<u8>> {
 
 fn parse_arg(a: &[u8]) -> Result<String> {
     let mut arg = String::from_utf8(a.to_vec()).map_err(|_| {
-        rusqlite::Error::InvalidParameterName(format!(
-            "Invalid argument: {}",
-            String::from_utf8_lossy(a)
-        ))
+        rusqlite::Error::InvalidParameterName(format!("Invalid argument: {}", String::from_utf8_lossy(a)))
     })?;
 
     // Strip surrounding single or double quotes if they exist
-    if (arg.starts_with('\'') && arg.ends_with('\''))
-        || (arg.starts_with('"') && arg.ends_with('"'))
-    {
+    if (arg.starts_with('\'') && arg.ends_with('\'')) || (arg.starts_with('"') && arg.ends_with('"')) {
         arg = arg[1..arg.len() - 1].to_string();
     }
 
@@ -186,17 +180,13 @@ impl BeechTable {
         let transaction_id = Id::from_hex(transaction_id_str.trim())?;
         let transaction = source.get_transaction(&transaction_id)?;
         let tab = source.get_table(&transaction, remote_table_name)?;
-        let total_rows = match &tab.root {
-            Some(root_id) => source.get_node(root_id, &tab.schema)?.row_count(),
-            None => 0,
-        };
+        let table_id = *transaction
+            .tables()
+            .get(remote_table_name)
+            .ok_or_else(|| BeechError::NoSuchTable(remote_table_name.into()))?;
 
-        let column_spec: String = tab
-            .columns()
-            .iter()
-            .filter_map(to_column_spec)
-            .collect::<Vec<_>>()
-            .join(", ");
+        let column_spec: String =
+            tab.columns().iter().filter_map(to_column_spec).collect::<Vec<_>>().join(", ");
         let create_sql = format!("CREATE TABLE {local_table_name} ({column_spec});");
 
         let table = BeechTable {
@@ -204,10 +194,7 @@ impl BeechTable {
             remote_table_name: remote_table_name.to_string(),
             source: Arc::new(source),
             data_path,
-            meta: TableMeta {
-                table: tab,
-                total_rows,
-            },
+            meta: TableMeta { table: tab, table_id },
         };
         Ok((create_sql, table))
     }
@@ -218,14 +205,12 @@ impl BeechTable {
         let candidates: Vec<CandidateConstraint> = info
             .constraints_and_usages()
             .filter_map(|(c, _)| {
-                from_sqlite_op(c.operator()).map(|op| CandidateConstraint {
-                    column: c.column(),
-                    op,
-                })
+                let column = usize::try_from(c.column()).ok()?;
+                from_sqlite_op(c.operator()).map(|op| CandidateConstraint { column, op })
             })
             .collect();
 
-        let mut plan = AccessPlan::select(table, candidates.iter().copied(), self.meta.total_rows);
+        let mut plan = AccessPlan::select(self.meta.table_id, table, &candidates)?;
 
         // ORDER BY consumption: the cursor walks leaves in ascending key
         // order. If SQLite's requested ordering is a leading prefix of the
@@ -250,10 +235,7 @@ impl BeechTable {
         info.set_estimated_rows(plan.estimate.estimated_rows);
 
         // Serialize plan to idx_str for the filter() side.
-        let schema = AccessPlan::get_schema();
-        let mut writer = apache_avro::Writer::new(&schema, Vec::new());
-        writer.append_ser(&plan)?;
-        let bytes = writer.into_inner()?;
+        let bytes = plan.encode()?;
         info.set_idx_str(&to_hex(&bytes));
         Ok(())
     }
@@ -313,10 +295,7 @@ unsafe impl<'vtab> VTab<'vtab> for BeechTable {
         _aux: Option<&Self::Aux>,
         args: &[&[u8]],
     ) -> Result<(String, Self)> {
-        let parsed_args = args
-            .iter()
-            .map(|a| parse_arg(a))
-            .collect::<Result<Vec<String>>>()?;
+        let parsed_args = args.iter().map(|a| parse_arg(a)).collect::<Result<Vec<String>>>()?;
 
         match &parsed_args[..]
         {
@@ -368,11 +347,7 @@ unsafe impl<'vtab> VTab<'vtab> for BeechTable {
 impl<'vtab> CreateVTab<'vtab> for BeechTable {
     const KIND: VTabKind = VTabKind::Default;
 
-    fn create(
-        db: &mut VTabConnection,
-        aux: Option<&Self::Aux>,
-        args: &[&[u8]],
-    ) -> Result<(String, Self)> {
+    fn create(db: &mut VTabConnection, aux: Option<&Self::Aux>, args: &[&[u8]]) -> Result<(String, Self)> {
         // For our virtual table, create and connect are the same
         Self::connect(db, aux, args)
     }
@@ -382,8 +357,9 @@ fn into_rusqlite_error(be: BeechError) -> rusqlite::Error {
     let message = be.to_string();
     let code = match &be {
         BeechError::Storage(StorageError::KeyNotFound { .. }) => ErrorCode::NotFound,
-        BeechError::Storage(StorageError::Io(_))
-        | BeechError::Storage(StorageError::Mmap { .. }) => ErrorCode::OperationInterrupted,
+        BeechError::Storage(StorageError::Io(_)) | BeechError::Storage(StorageError::Mmap { .. }) => {
+            ErrorCode::OperationInterrupted
+        }
         BeechError::Domain(DomainError::NoSuchTable { .. })
         | BeechError::Domain(DomainError::KeyNotFound { .. }) => ErrorCode::NotFound,
         BeechError::Domain(DomainError::DuplicateKey { .. }) => ErrorCode::ConstraintViolation,
@@ -403,7 +379,7 @@ fn into_rusqlite_error(be: BeechError) -> rusqlite::Error {
 #[repr(C)]
 struct BeechCursor {
     base: sqlite3_vtab_cursor,
-    cursor: beech_core::query::Cursor,
+    cursor: beech_core::query::RowCursor,
     source: Arc<dyn NodeSource>,
 }
 
@@ -411,7 +387,7 @@ impl BeechCursor {
     fn new(table: &Table, source: Arc<dyn NodeSource>) -> Self {
         Self {
             base: sqlite3_vtab_cursor::default(),
-            cursor: beech_core::query::Cursor::new(table),
+            cursor: beech_core::query::RowCursor::new(table),
             source,
         }
     }
@@ -450,18 +426,10 @@ impl BeechCursor {
             SchemaError::Mismatch("xFilter called without an AccessPlan in idx_str".to_string())
         })?;
         let bytes = from_hex(idx_str)?;
-        let schema = AccessPlan::get_schema();
-        let mut reader = apache_avro::Reader::with_schema(&schema, &bytes[..])?;
-        let value = reader
-            .next()
-            .ok_or(WireError::Truncated)?
-            .map_err(WireError::from)?;
-        let plan: AccessPlan = apache_avro::from_value(&value)?;
+        let plan = AccessPlan::decode(&bytes)?;
 
         if plan.table_id != self.cursor.table.id {
-            return Err(
-                SchemaError::Mismatch("table id mismatch in AccessPlan".to_string()).into(),
-            );
+            return Err(SchemaError::Mismatch("table id mismatch in AccessPlan".to_string()).into());
         }
         debug!(
             "beech_filter(): schema matches, {} search slots",
@@ -497,8 +465,7 @@ impl BeechCursor {
 unsafe impl VTabCursor for BeechCursor {
     // Required methods
     fn filter(&mut self, idx_num: c_int, idx_str: Option<&str>, args: &Filters<'_>) -> Result<()> {
-        self.do_filter(idx_num, idx_str, args)
-            .map_err(into_rusqlite_error)
+        self.do_filter(idx_num, idx_str, args).map_err(into_rusqlite_error)
     }
     fn next(&mut self) -> Result<()> {
         self.cursor.next(&*self.source).map_err(into_rusqlite_error)
@@ -512,9 +479,7 @@ unsafe impl VTabCursor for BeechCursor {
                 if let Some(field_value) = values.get(i as usize) {
                     // Convert Avro value to SQLite value
                     match field_value {
-                        apache_avro::types::Value::Null => {
-                            ctx.set_result(&rusqlite::types::Null)?
-                        }
+                        apache_avro::types::Value::Null => ctx.set_result(&rusqlite::types::Null)?,
                         apache_avro::types::Value::Boolean(b) => ctx.set_result(b)?,
                         apache_avro::types::Value::Int(n) => ctx.set_result(n)?,
                         apache_avro::types::Value::Long(n) => ctx.set_result(n)?,
@@ -543,10 +508,7 @@ unsafe impl VTabCursor for BeechCursor {
         let Some((node_id, row_idx)) = self.cursor.current() else {
             return Ok(0);
         };
-        let node = self
-            .source
-            .get_node(node_id, &self.cursor.table.schema)
-            .map_err(into_rusqlite_error)?;
+        let node = self.source.get_node(node_id, &self.cursor.table.schema).map_err(into_rusqlite_error)?;
         match &*node {
             beech_core::Node::Leaf(leaf) => {
                 let entry = leaf.entry(*row_idx).ok_or_else(|| {

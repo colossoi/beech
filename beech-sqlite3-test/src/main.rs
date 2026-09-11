@@ -152,12 +152,7 @@ fn get_test_data_path() -> Option<PathBuf> {
     }
 
     // Check common test data locations
-    let candidates = [
-        "/tmp/test_data",
-        "./test_data",
-        "../test_data",
-        "../../test_data",
-    ];
+    let candidates = ["/tmp/test_data", "./test_data", "../test_data", "../../test_data"];
 
     for candidate in &candidates {
         let path = PathBuf::from(candidate);

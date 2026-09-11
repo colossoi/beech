@@ -1,207 +1,104 @@
-#![allow(unused_imports)]
-use super::*;
-use apache_avro::Schema;
-use apache_avro::types::Value;
-
-fn int_schema(name: &str, field_names: &[&str]) -> Schema {
-    let fields: Vec<String> = field_names
-        .iter()
-        .map(|f| format!(r#"{{"name":"{}","type":"int"}}"#, f))
-        .collect();
-    let s = format!(
-        r#"{{"type":"record","name":"{}","fields":[{}]}}"#,
-        name,
-        fields.join(",")
-    );
-    Schema::parse_str(&s).unwrap()
-}
+use crate::{test_support::*, *};
+use std::cmp::Ordering;
 
 #[test]
-fn id_from_hex_round_trip() {
-    let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let id = Id::from_hex(hex).unwrap();
-    // Display uses hex; compare case-insensitively because uppercase is valid too.
-    assert_eq!(format!("{}", id).to_lowercase(), hex);
-    let again = Id::from_hex(&format!("{}", id)).unwrap();
-    assert_eq!(id, again);
+fn id_hex_round_trip_and_rejection() {
+    let text = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let id = Id::from_hex(text).unwrap();
+    assert_eq!(id.to_string(), text);
+    assert_eq!(Id::from_hex(&text.to_uppercase()).unwrap(), id);
+    for bad in ["abc", &"z".repeat(64), &"é".repeat(32)] {
+        assert!(Id::from_hex(bad).is_err());
+    }
+    assert!(Id::from_slice(&[0; 31]).is_err());
 }
-
 #[test]
-fn id_from_hex_rejects_odd_length() {
-    let err = Id::from_hex("abc");
-    assert!(err.is_err());
-}
-
-#[test]
-fn id_from_hex_rejects_non_hex() {
-    let bad = "zz23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let err = Id::from_hex(bad);
-    assert!(err.is_err());
-}
-
-#[test]
-fn key_ordering_lexicographic() {
-    let a: Key = vec![Value::Int(1), Value::Int(2)];
-    let b: Key = vec![Value::Int(1), Value::Int(3)];
-    let c: Key = vec![Value::Int(2), Value::Int(0)];
-    assert_eq!(a.compare_key(&b), std::cmp::Ordering::Less);
-    assert_eq!(b.compare_key(&a), std::cmp::Ordering::Greater);
-    assert_eq!(a.compare_key(&a.clone()), std::cmp::Ordering::Equal);
-    assert_eq!(b.compare_key(&c), std::cmp::Ordering::Less);
-}
-
-#[test]
-fn key_ordering_handles_mixed_types() {
-    // Int vs Long should compare numerically, not bail out.
-    let a: Key = vec![Value::Int(5)];
-    let b: Key = vec![Value::Long(10)];
-    assert_eq!(a.compare_key(&b), std::cmp::Ordering::Less);
-
-    // Null should be less than anything.
-    let n: Key = vec![Value::Null];
-    let x: Key = vec![Value::Int(0)];
-    assert_eq!(n.compare_key(&x), std::cmp::Ordering::Less);
-}
-
-#[test]
-fn table_new_rejects_non_record_schemas() {
-    let schema = TableSchema {
-        key_scheme: Schema::Int,
-        row_scheme: Schema::Int,
-    };
-    let result = Table::new(1i64.into(), "t".to_string(), None, schema);
-    assert!(result.is_err());
-}
-
-#[test]
-fn table_new_rejects_unsupported_field_type() {
-    // Array-of-int is not in the supported primitive set.
-    let row_scheme = Schema::parse_str(
-        r#"{"type":"record","name":"r","fields":[{"name":"xs","type":{"type":"array","items":"int"}}]}"#,
-    )
-    .unwrap();
-    let key_scheme = int_schema("k", &["xs"]);
-    let schema = TableSchema {
-        key_scheme,
-        row_scheme,
-    };
-    let result = Table::new(1i64.into(), "t".to_string(), None, schema);
-    assert!(result.is_err());
-}
-
-fn two_int_table() -> Table {
-    let schema = TableSchema {
-        key_scheme: int_schema("k", &["a"]),
-        row_scheme: int_schema("r", &["a", "b"]),
-    };
-    Table::new(1i64.into(), "t".to_string(), None, schema).unwrap()
-}
-
-#[test]
-fn node_keys_internal_returns_separators() {
-    let keys = vec![vec![Value::Int(10)], vec![Value::Int(20)]];
-    let node = Node::Internal(InternalNode {
-        keys: keys.clone(),
-        children: vec![1i64.into(), 2i64.into(), 3i64.into()],
-        subtree_height: 1,
-        subtree_row_count: 30,
-    });
-    assert_eq!(node.keys(), keys.as_slice());
-    assert_eq!(node.len(), 3);
-    assert_eq!(node.last_slot_index(), Some(2));
-    assert!(node.is_internal());
-    assert!(!node.is_leaf());
-    assert_eq!(node.depth(), 1);
-    assert_eq!(node.row_count(), 30);
-}
-
-#[test]
-fn node_keys_leaf_returns_one_per_entry() {
-    let keys = vec![
-        vec![Value::Int(1)],
-        vec![Value::Int(2)],
-        vec![Value::Int(3)],
-    ];
-    let entries: Vec<LeafEntry> = vec![
-        LeafEntry {
-            row: (10, vec![Value::Int(1), Value::Int(100)]),
-        },
-        LeafEntry {
-            row: (11, vec![Value::Int(2), Value::Int(200)]),
-        },
-        LeafEntry {
-            row: (12, vec![Value::Int(3), Value::Int(300)]),
-        },
-    ];
-    let node = Node::Leaf(LeafNode {
-        keys: keys.clone(),
-        entries,
-    });
-    assert_eq!(node.keys(), keys.as_slice());
-    assert_eq!(node.keys().len(), 3);
-    assert_eq!(node.len(), 3);
-    assert!(node.is_leaf());
-    assert!(!node.is_internal());
-    assert_eq!(node.depth(), 0);
-    assert_eq!(node.row_count(), 3);
-}
-
-#[test]
-fn leaf_entry_key_derives_from_table() {
-    let table = two_int_table();
-    let entry = LeafEntry {
-        row: (42, vec![Value::Int(7), Value::Int(99)]),
-    };
-    assert_eq!(entry.row_id(), 42);
-    assert_eq!(entry.values(), &[Value::Int(7), Value::Int(99)]);
-    assert_eq!(entry.key(&table), vec![Value::Int(7)]);
-}
-
-#[test]
-fn node_owned_key_at_returns_correct_key() {
-    let table = two_int_table();
-    let leaf = Node::Leaf(LeafNode {
-        keys: vec![vec![Value::Int(5)], vec![Value::Int(6)]],
-        entries: vec![
-            LeafEntry {
-                row: (1, vec![Value::Int(5), Value::Int(50)]),
-            },
-            LeafEntry {
-                row: (2, vec![Value::Int(6), Value::Int(60)]),
-            },
-        ],
-    });
-    assert_eq!(leaf.owned_key_at(&table, 0), Some(vec![Value::Int(5)]));
-    assert_eq!(leaf.owned_key_at(&table, 1), Some(vec![Value::Int(6)]));
-    assert_eq!(leaf.owned_key_at(&table, 2), None);
-
-    let internal = Node::Internal(InternalNode {
-        keys: vec![vec![Value::Int(100)]],
-        children: vec![1i64.into(), 2i64.into()],
-        subtree_height: 1,
-        subtree_row_count: 10,
-    });
+fn scalar_order_is_typed_and_lexicographic() {
     assert_eq!(
-        internal.owned_key_at(&table, 0),
-        Some(vec![Value::Int(100)])
+        vec![Scalar::Null].compare_key(&vec![Scalar::Int64(0)]).unwrap(),
+        Ordering::Less
     );
+    assert_eq!(
+        vec![Scalar::Int64(1), Scalar::Int32(3)]
+            .compare_key(&vec![Scalar::Int64(2), Scalar::Int32(1)])
+            .unwrap(),
+        Ordering::Less
+    );
+    assert!(Scalar::Int64(1).compare(&Scalar::Utf8("1".into())).is_err());
+    assert!(Scalar::Int64(1).compare(&Scalar::UInt64(1)).is_err());
+    assert_eq!(
+        Scalar::Float64(-0.0).compare(&Scalar::Float64(0.0)).unwrap(),
+        Ordering::Less
+    );
+    assert_ne!(Scalar::Float64(-0.0), Scalar::Float64(0.0));
+    let nan = Scalar::Float64(f64::from_bits(0x7ff8000000000001));
+    assert_eq!(nan, nan.clone());
 }
 
 #[test]
-fn last_slot_index_handles_empty() {
-    let empty_leaf = Node::Leaf(LeafNode {
-        keys: vec![],
-        entries: vec![],
-    });
-    assert_eq!(empty_leaf.last_slot_index(), None);
-    assert!(empty_leaf.is_empty());
+fn scalar_views_borrow_sliced_arrow_buffers() {
+    use crate::value::ScalarRef;
+    use arrow_array::{BinaryArray, StringArray};
 
-    let empty_internal = Node::Internal(InternalNode {
-        keys: vec![],
-        children: vec![],
-        subtree_height: 1,
-        subtree_row_count: 0,
-    });
-    assert_eq!(empty_internal.last_slot_index(), None);
-    assert!(empty_internal.is_empty());
+    let strings = StringArray::from(vec![Some("skip"), Some("héllo"), None]).slice(1, 2);
+    let ScalarRef::Utf8(text) = ScalarRef::from_array(&strings, 0).unwrap() else {
+        panic!("expected borrowed string");
+    };
+    assert_eq!(text, "héllo");
+    assert_eq!(text.as_ptr(), strings.value(0).as_ptr());
+    assert!(ScalarRef::from_array(&strings, 1).unwrap().is_null());
+    assert!(ScalarRef::from_array(&strings, 2).is_err());
+
+    let binary = BinaryArray::from(vec![Some(&b"skip"[..]), Some(&b"\0\xff"[..]), None]).slice(1, 2);
+    let ScalarRef::Binary(bytes) = ScalarRef::from_array(&binary, 0).unwrap() else {
+        panic!("expected borrowed bytes");
+    };
+    assert_eq!(bytes, b"\0\xff");
+    assert_eq!(bytes.as_ptr(), binary.value(0).as_ptr());
+    assert!(ScalarRef::from_array(&binary, 1).unwrap().is_null());
+}
+#[test]
+fn schema_rejects_invalid_columns_and_keys() {
+    let f = Field::new("x", DataType::Int64, false);
+    for keys in [vec![], vec![1], vec![0, 0]] {
+        assert!(TableSchema::new(vec![f.clone()], keys).is_err());
+    }
+    assert!(TableSchema::new(vec![f.clone(), f], vec![0]).is_err());
+    assert!(TableSchema::new(vec![Field::new(ROW_ID_COLUMN, DataType::Int64, false)], vec![0]).is_err());
+    assert!(TableSchema::new(vec![Field::new("x", DataType::Date32, false)], vec![0]).is_err());
+    assert!(batch_from_rows(&schema(), &[(1, vec![Scalar::Null; 4])]).is_err());
+}
+#[test]
+fn internal_fences_cover_final_child_and_reject_bad_structure() {
+    let s = schema();
+    let (_, _, objects) = build(&s, &rows(12), 4, 3);
+    let internal = codec::thrift::decode_internal(&objects.last().unwrap().bytes, &s).unwrap();
+    for (key, slot) in [
+        (-1, Some(0)),
+        (3, Some(0)),
+        (4, Some(1)),
+        (7, Some(1)),
+        (8, Some(2)),
+        (11, Some(2)),
+        (12, None),
+    ] {
+        assert_eq!(internal.seek(&s, &vec![Scalar::Int64(key)]).unwrap(), slot);
+    }
+    let mut bad = internal.clone();
+    bad.children.swap(0, 1);
+    assert!(bad.validate(&s).is_err());
+    let mut bad = internal.clone();
+    bad.children[0].height = 1;
+    assert!(bad.validate(&s).is_err());
+    let mut bad = internal.clone();
+    bad.children[0].row_count = u64::MAX;
+    assert!(bad.validate(&s).is_err());
+    assert!(InternalNode::new(&s, 1, vec![]).is_err());
+}
+#[test]
+fn empty_and_single_leaf_root_contract() {
+    let (empty, _, _) = build(&schema(), &[], 4, 3);
+    assert!(empty.root.is_none());
+    let (single, _, _) = build(&schema(), &rows(2), 4, 3);
+    assert_eq!(single.root.unwrap().height, 0);
 }

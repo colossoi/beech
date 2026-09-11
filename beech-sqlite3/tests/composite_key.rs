@@ -18,9 +18,7 @@ fn two_part_key_round_trip() {
     let conn = setup_vtab(tmp.path(), "t", "tt");
 
     // Full scan should return all 20 rows.
-    let count: i64 = conn
-        .query_row("SELECT count(*) FROM tt", [], |r| r.get(0))
-        .unwrap();
+    let count: i64 = conn.query_row("SELECT count(*) FROM tt", [], |r| r.get(0)).unwrap();
     assert_eq!(count, 20);
 
     // Point lookup on first key part.

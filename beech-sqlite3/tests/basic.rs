@@ -21,9 +21,7 @@ fn select_star_returns_all_rows() {
     let tmp = make_test_tree(rows, vec![0], "t");
     let conn = setup_vtab(tmp.path(), "t", "test_table");
 
-    let count: i64 = conn
-        .query_row("SELECT count(*) FROM test_table", [], |r| r.get(0))
-        .unwrap();
+    let count: i64 = conn.query_row("SELECT count(*) FROM test_table", [], |r| r.get(0)).unwrap();
     assert_eq!(count, n);
 }
 
@@ -34,8 +32,6 @@ fn count_returns_row_count() {
     let tmp = make_test_tree(rows, vec![0], "t");
     let conn = setup_vtab(tmp.path(), "t", "test_table");
 
-    let count: i64 = conn
-        .query_row("SELECT count(*) FROM test_table", [], |r| r.get(0))
-        .unwrap();
+    let count: i64 = conn.query_row("SELECT count(*) FROM test_table", [], |r| r.get(0)).unwrap();
     assert_eq!(count, n);
 }

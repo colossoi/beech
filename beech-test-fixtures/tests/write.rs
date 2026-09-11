@@ -1,5 +1,5 @@
 use apache_avro::types::Value;
-use beech_core::query::Cursor;
+use beech_core::query::RowCursor;
 use beech_core::{BeechError, DomainError, NodeSource, Table};
 use beech_test_fixtures::{build_simple_table, MemoryNodeSource, MemoryStore};
 use beech_write::{merge_changes, Change, Writer};
@@ -17,7 +17,7 @@ fn int_row(i: i64, v: i32) -> (i64, Value) {
 }
 
 fn collect_row_ids(source: &MemoryNodeSource, table: &Table) -> Vec<i64> {
-    let mut cursor = Cursor::new(table);
+    let mut cursor = RowCursor::new(table);
     cursor.init(vec![], vec![]);
     cursor.advance_to_left(source).unwrap();
     let mut out = Vec::new();
@@ -31,7 +31,7 @@ fn collect_row_ids(source: &MemoryNodeSource, table: &Table) -> Vec<i64> {
 }
 
 fn collect_pairs(source: &MemoryNodeSource, table: &Table) -> Vec<(i64, i32, i32)> {
-    let mut cursor = Cursor::new(table);
+    let mut cursor = RowCursor::new(table);
     cursor.init(vec![], vec![]);
     cursor.advance_to_left(source).unwrap();
     let mut out = Vec::new();

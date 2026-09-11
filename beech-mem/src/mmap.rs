@@ -1,6 +1,6 @@
 use libc::{
-    c_void, mlock, mmap, mprotect, munlock, munmap, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED,
-    PROT_READ, PROT_WRITE,
+    c_void, mlock, mmap, mprotect, munlock, munmap, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, PROT_READ,
+    PROT_WRITE,
 };
 use std::{fs::File, os::unix::prelude::AsRawFd, ptr::NonNull, sync::Arc};
 

@@ -4,11 +4,8 @@ use common::*;
 fn get_plan(conn: &rusqlite::Connection, sql: &str) -> Vec<String> {
     let explain = format!("EXPLAIN QUERY PLAN {}", sql);
     let mut stmt = conn.prepare(&explain).unwrap();
-    let plans: Vec<String> = stmt
-        .query_map([], |r| r.get::<_, String>(3))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+    let plans: Vec<String> =
+        stmt.query_map([], |r| r.get::<_, String>(3)).unwrap().map(|r| r.unwrap()).collect();
     plans
 }
 
@@ -21,10 +18,7 @@ fn eq_query_estimates_one_row() {
     let plans = get_plan(&conn, "SELECT k FROM tt WHERE k = 42");
     // The plan should show the vtab scan. We mainly verify it doesn't crash
     // and produces a plan entry referencing our table.
-    assert!(
-        !plans.is_empty(),
-        "EXPLAIN QUERY PLAN should produce output"
-    );
+    assert!(!plans.is_empty(), "EXPLAIN QUERY PLAN should produce output");
     let plan_text = plans.join(" ");
     assert!(
         plan_text.contains("tt"),
@@ -40,10 +34,7 @@ fn full_scan_estimates_total_rows() {
     let conn = setup_vtab(tmp.path(), "t", "tt");
 
     let plans = get_plan(&conn, "SELECT * FROM tt");
-    assert!(
-        !plans.is_empty(),
-        "EXPLAIN QUERY PLAN should produce output"
-    );
+    assert!(!plans.is_empty(), "EXPLAIN QUERY PLAN should produce output");
     let plan_text = plans.join(" ");
     assert!(
         plan_text.contains("tt"),

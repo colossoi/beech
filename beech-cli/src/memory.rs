@@ -4,9 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use beech_core::wire::{decode_node, decode_root, decode_table, decode_transaction};
-use beech_core::{
-    DomainError, Id, Node, Result, Root, StorageError, Table, TableSchema, Transaction,
-};
+use beech_core::{DomainError, Id, Node, Result, Root, StorageError, Table, TableSchema, Transaction};
 
 /// Memory-backed writer for testing that doesn't write to filesystem
 pub struct Writer {

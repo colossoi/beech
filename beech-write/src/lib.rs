@@ -5,8 +5,8 @@ use apache_avro::{
 };
 use beech_core::{
     wire::{encode_node, encode_root, encode_table, encode_transaction, find_key_columns},
-    DomainError, Id, InternalNode, Key, KeyOrdering, LeafEntry, LeafNode, Node, NodeSource,
-    QueryError, Result, Root, SchemaError, Table, TableSchema, Transaction,
+    DomainError, Id, InternalNode, Key, KeyOrdering, LeafEntry, LeafNode, Node, NodeSource, QueryError,
+    Result, Root, SchemaError, Table, TableSchema, Transaction,
 };
 use beech_shaper::ProbShaper;
 use sha2::{Digest, Sha256};
@@ -124,23 +124,14 @@ pub fn write_rows_to_prolly_tree<W: Writer>(
     for (row_id, record) in rows {
         let values = record_to_fields(&record)?;
         let key = key_from_row_values(&key_columns, &values);
-        row_records.push(RowRecord {
-            key,
-            row_id,
-            values,
-        });
+        row_records.push(RowRecord { key, row_id, values });
     }
 
     row_records.sort_by(|a, b| a.key.compare_key(&b.key));
     reject_duplicate_keys(&row_records)?;
 
-    let root_node_id = build_and_write_tree(
-        writer,
-        &schema,
-        row_records,
-        target_node_size,
-        node_size_stddev,
-    )?;
+    let root_node_id =
+        build_and_write_tree(writer, &schema, row_records, target_node_size, node_size_stddev)?;
     write_table_transaction_and_root(writer, table_name, schema, root_node_id, prev_id)
 }
 
@@ -170,13 +161,7 @@ where
         return Ok(None);
     }
 
-    build_and_write_tree(
-        writer,
-        &table.schema,
-        merged,
-        target_node_size,
-        node_size_stddev,
-    )
+    build_and_write_tree(writer, &table.schema, merged, target_node_size, node_size_stddev)
 }
 
 // =============================================================================
@@ -197,13 +182,7 @@ fn build_and_write_tree<W: Writer>(
     let leaf_summaries =
         build_and_write_leaf_nodes(writer, schema, rows, target_node_size, node_size_stddev)?;
 
-    build_and_write_branch_levels(
-        writer,
-        schema,
-        leaf_summaries,
-        target_node_size,
-        node_size_stddev,
-    )
+    build_and_write_branch_levels(writer, schema, leaf_summaries, target_node_size, node_size_stddev)
 }
 
 fn build_and_write_leaf_nodes<W: Writer>(
@@ -280,18 +259,14 @@ fn build_and_write_branch_levels<W: Writer>(
 
 fn build_leaf_page(rows: Vec<RowRecord>, shaper: &ProbShaper) -> Result<BuiltNode> {
     if rows.is_empty() {
-        return Err(
-            DomainError::InvalidArgs("leaf node requires at least one row".to_string()).into(),
-        );
+        return Err(DomainError::InvalidArgs("leaf node requires at least one row".to_string()).into());
     }
 
     let id: Id = shaper.id().into();
 
     let keys: Vec<Key> = rows.iter().map(|r| r.key.clone()).collect();
-    let highest_key = keys
-        .last()
-        .cloned()
-        .ok_or_else(|| QueryError::Malformed("leaf node had no highest key"))?;
+    let highest_key =
+        keys.last().cloned().ok_or_else(|| QueryError::Malformed("leaf node had no highest key"))?;
 
     let entries: Vec<LeafEntry> = rows
         .into_iter()
@@ -315,10 +290,7 @@ fn build_leaf_page(rows: Vec<RowRecord>, shaper: &ProbShaper) -> Result<BuiltNod
 
 fn build_branch_page(children: Vec<NodeSummary>, shaper: &ProbShaper) -> Result<BuiltNode> {
     if children.is_empty() {
-        return Err(DomainError::InvalidArgs(
-            "branch node requires at least one child".to_string(),
-        )
-        .into());
+        return Err(DomainError::InvalidArgs("branch node requires at least one child".to_string()).into());
     }
 
     let id: Id = shaper.id().into();
@@ -333,10 +305,7 @@ fn build_branch_page(children: Vec<NodeSummary>, shaper: &ProbShaper) -> Result<
 
     let child_ids: Vec<Id> = children.iter().map(|c| c.id.clone()).collect();
     let keys: Vec<Key> = if children.len() > 1 {
-        children[..children.len() - 1]
-            .iter()
-            .map(|c| c.highest_key.clone())
-            .collect()
+        children[..children.len() - 1].iter().map(|c| c.highest_key.clone()).collect()
     } else {
         vec![]
     };
@@ -371,10 +340,7 @@ fn write_built_node<W: Writer>(
 // Merge pipeline
 // =============================================================================
 
-fn collect_existing_rows<NS: NodeSource>(
-    table: &Table,
-    node_source: &NS,
-) -> Result<Vec<RowRecord>> {
+fn collect_existing_rows<NS: NodeSource>(table: &Table, node_source: &NS) -> Result<Vec<RowRecord>> {
     let Some(root_id) = &table.root else {
         return Ok(vec![]);
     };
@@ -443,11 +409,7 @@ where
                         Change::Insert { key, .. } => {
                             return Err(DomainError::DuplicateKey { key }.into());
                         }
-                        Change::Update {
-                            key,
-                            row_id,
-                            record,
-                        } => {
+                        Change::Update { key, row_id, record } => {
                             out.push(RowRecord {
                                 key,
                                 row_id,
@@ -462,11 +424,7 @@ where
                 Ordering::Greater => {
                     let change = changes.next().expect("peeked change exists");
                     match change {
-                        Change::Insert {
-                            key,
-                            row_id,
-                            record,
-                        } => {
+                        Change::Insert { key, row_id, record } => {
                             out.push(RowRecord {
                                 key,
                                 row_id,
@@ -484,11 +442,7 @@ where
 
     while let Some(change) = changes.next() {
         match change {
-            Change::Insert {
-                key,
-                row_id,
-                record,
-            } => {
+            Change::Insert { key, row_id, record } => {
                 out.push(RowRecord {
                     key,
                     row_id,
@@ -532,10 +486,7 @@ fn write_table_transaction_and_root<W: Writer>(
     let table = Table::new(table_id.clone(), table_name.clone(), root_node_id, schema)?;
     let table_bytes = encode_table(
         &table,
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64,
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis() as i64,
     )?;
     writer.write(file_name(&table_id), &table_bytes)?;
 
@@ -766,9 +717,7 @@ fn generate_transaction_id(prev_id: &Id, transaction_time: &SystemTime) -> Id {
     let mut hasher = Sha256::new();
     hasher.update(prev_id.as_bytes());
 
-    let duration = transaction_time
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
+    let duration = transaction_time.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
     hasher.update(duration.as_secs().to_le_bytes());
     hasher.update(duration.subsec_nanos().to_le_bytes());
 

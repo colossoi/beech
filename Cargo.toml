@@ -3,10 +3,8 @@ resolver = "2"
 members = ["beech-core", "beech-mem", "beech-shaper", "beech-sqlite3", "beech-cli", "beech-write", "beech-sqlite3-test", "beech-test-fixtures"]
 
 [workspace.dependencies]
-apache-avro = { version = "0.18.0", features = ["derive"]}
 serde = {version = "1.0.219", features = ["derive"]}
 serde-value = "0.7.0"
 serde_bytes = "0.11.17"
 thiserror = "2.0.12"
 anyhow = "1.0.99"
-#apache-avro-derive = "0.18.0"

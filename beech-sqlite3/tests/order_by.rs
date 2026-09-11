@@ -9,11 +9,9 @@ fn order_by_key_asc_consumed() {
 
     // ORDER BY k ASC should be consumed by the vtab (no sort step).
     let plan: String = conn
-        .query_row(
-            "EXPLAIN QUERY PLAN SELECT k FROM tt ORDER BY k ASC",
-            [],
-            |r| r.get(3),
-        )
+        .query_row("EXPLAIN QUERY PLAN SELECT k FROM tt ORDER BY k ASC", [], |r| {
+            r.get(3)
+        })
         .unwrap();
     // If the vtab consumed the ORDER BY, SQLite should NOT show "USE TEMP
     // B-TREE FOR ORDER BY" in the plan output.
@@ -25,11 +23,7 @@ fn order_by_key_asc_consumed() {
 
     // Also verify the results are actually sorted.
     let mut stmt = conn.prepare("SELECT k FROM tt ORDER BY k ASC").unwrap();
-    let ks: Vec<i32> = stmt
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+    let ks: Vec<i32> = stmt.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect();
     assert_eq!(ks, (0..50).collect::<Vec<i32>>());
 }
 
@@ -42,11 +36,7 @@ fn order_by_key_desc_not_consumed() {
     // DESC is not natively supported, so results should still be correct
     // even though SQLite adds its own sort.
     let mut stmt = conn.prepare("SELECT k FROM tt ORDER BY k DESC").unwrap();
-    let ks: Vec<i32> = stmt
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+    let ks: Vec<i32> = stmt.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect();
     let expected: Vec<i32> = (0..20).rev().collect();
     assert_eq!(ks, expected);
 }

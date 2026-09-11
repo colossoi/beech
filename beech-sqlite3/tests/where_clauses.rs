@@ -22,14 +22,8 @@ fn where_range_on_key() {
     let tmp = make_test_tree(rows, vec![0], "t");
     let conn = setup_vtab(tmp.path(), "t", "tt");
 
-    let mut stmt = conn
-        .prepare("SELECT k FROM tt WHERE k >= 10 AND k < 20")
-        .unwrap();
-    let ks: Vec<i32> = stmt
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+    let mut stmt = conn.prepare("SELECT k FROM tt WHERE k >= 10 AND k < 20").unwrap();
+    let ks: Vec<i32> = stmt.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect();
     assert_eq!(ks, (10..20).collect::<Vec<i32>>());
 }
 
@@ -41,11 +35,7 @@ fn where_eq_on_non_key_column() {
 
     // v is not a key column, so this is a full scan with SQLite filtering.
     let mut stmt = conn.prepare("SELECT k FROM tt WHERE v = 3").unwrap();
-    let ks: Vec<i32> = stmt
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+    let ks: Vec<i32> = stmt.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect();
     // keys 3, 8, 13, 18 all have v = 3
     assert_eq!(ks, vec![3, 8, 13, 18]);
 }

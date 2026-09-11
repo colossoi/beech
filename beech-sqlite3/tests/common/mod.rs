@@ -22,8 +22,7 @@ impl FileWriter {
 
 impl Writer for FileWriter {
     fn write<P: AsRef<Path>>(&mut self, name: P, data: &[u8]) -> std::io::Result<()> {
-        self.pending
-            .push((self.dir.join(name.as_ref()), data.to_vec()));
+        self.pending.push((self.dir.join(name.as_ref()), data.to_vec()));
         Ok(())
     }
 
@@ -45,11 +44,7 @@ impl Writer for FileWriter {
 
 /// Build a prolly tree on disk in a temp directory. Returns the TempDir
 /// (must be kept alive) and the table name used.
-pub fn make_test_tree(
-    rows: Vec<(i64, Value)>,
-    key_columns: Vec<usize>,
-    table_name: &str,
-) -> TempDir {
+pub fn make_test_tree(rows: Vec<(i64, Value)>, key_columns: Vec<usize>, table_name: &str) -> TempDir {
     let tmp = TempDir::new().unwrap();
     let mut writer = FileWriter::new(tmp.path());
     let (transaction_id, _table_id) = write_rows_to_prolly_tree(

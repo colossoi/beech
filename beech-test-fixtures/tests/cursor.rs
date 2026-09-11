@@ -1,5 +1,5 @@
 use apache_avro::types::Value;
-use beech_core::query::{Constraint, ConstraintOp, Cursor};
+use beech_core::query::{Constraint, ConstraintOp, RowCursor};
 use beech_core::{Id, NodeSource, Table};
 use beech_test_fixtures::{build_simple_table, MemoryNodeSource};
 use std::sync::Arc;
@@ -21,7 +21,7 @@ fn two_part_row(row_id: i64, a: i32, b: i32, payload: i32) -> (i64, Value) {
     (row_id, record)
 }
 
-fn drain_row_ids(cursor: &mut Cursor, source: &MemoryNodeSource, table: &Table) -> Vec<i64> {
+fn drain_row_ids(cursor: &mut RowCursor, source: &MemoryNodeSource, table: &Table) -> Vec<i64> {
     let mut out = Vec::new();
     loop {
         let (page_id, slot) = match cursor.current() {
@@ -46,7 +46,7 @@ fn build_int_table(n: i64) -> (MemoryNodeSource, Arc<Table>) {
 #[test]
 fn cursor_full_scan_yields_all_rows() {
     let (source, table) = build_int_table(200);
-    let mut cursor = Cursor::new(&table);
+    let mut cursor = RowCursor::new(&table);
     cursor.init(vec![], vec![]);
     cursor.advance_to_left(&source).unwrap();
     let ids = drain_row_ids(&mut cursor, &source, &table);
@@ -58,11 +58,8 @@ fn cursor_full_scan_yields_all_rows() {
 #[test]
 fn cursor_eq_constraint_yields_single_row() {
     let (source, table) = build_int_table(50);
-    let mut cursor = Cursor::new(&table);
-    cursor.init(
-        vec![Constraint::new(0, ConstraintOp::Eq)],
-        vec![Value::Int(17)],
-    );
+    let mut cursor = RowCursor::new(&table);
+    cursor.init(vec![Constraint::new(0, ConstraintOp::Eq)], vec![Value::Int(17)]);
     cursor.advance_to_left(&source).unwrap();
     let ids = drain_row_ids(&mut cursor, &source, &table);
     assert_eq!(ids, vec![17]);
@@ -71,7 +68,7 @@ fn cursor_eq_constraint_yields_single_row() {
 #[test]
 fn cursor_range_constraint_yields_subset() {
     let (source, table) = build_int_table(50);
-    let mut cursor = Cursor::new(&table);
+    let mut cursor = RowCursor::new(&table);
     cursor.init(
         vec![
             Constraint::new(0, ConstraintOp::Ge),
@@ -87,7 +84,7 @@ fn cursor_range_constraint_yields_subset() {
 #[test]
 fn cursor_done_iterating_clears_stack() {
     let (source, table) = build_int_table(20);
-    let mut cursor = Cursor::new(&table);
+    let mut cursor = RowCursor::new(&table);
     cursor.init(vec![], vec![]);
     cursor.advance_to_left(&source).unwrap();
     let _ids = drain_row_ids(&mut cursor, &source, &table);
@@ -98,22 +95,18 @@ fn cursor_done_iterating_clears_stack() {
 
 #[test]
 fn cursor_composite_key_prefix_eq() {
-    let rows: Vec<(i64, Value)> = (0..5)
-        .flat_map(|a| (0..4).map(move |b| two_part_row(a * 10 + b, a as i32, b as i32, 0)))
-        .collect();
+    let rows: Vec<(i64, Value)> =
+        (0..5).flat_map(|a| (0..4).map(move |b| two_part_row(a * 10 + b, a as i32, b as i32, 0))).collect();
     let expected_row_count = rows.len() as i64;
     let (_store, source, table) = build_simple_table("t", rows, vec![0, 1], 64, 16).unwrap();
 
-    let mut cursor = Cursor::new(&table);
-    cursor.init(
-        vec![Constraint::new(0, ConstraintOp::Eq)],
-        vec![Value::Int(3)],
-    );
+    let mut cursor = RowCursor::new(&table);
+    cursor.init(vec![Constraint::new(0, ConstraintOp::Eq)], vec![Value::Int(3)]);
     cursor.advance_to_left(&source).unwrap();
     let ids = drain_row_ids(&mut cursor, &source, &table);
     assert_eq!(ids, vec![30, 31, 32, 33]);
 
-    let mut scan = Cursor::new(&table);
+    let mut scan = RowCursor::new(&table);
     scan.init(vec![], vec![]);
     scan.advance_to_left(&source).unwrap();
     let all = drain_row_ids(&mut scan, &source, &table);
@@ -123,7 +116,7 @@ fn cursor_composite_key_prefix_eq() {
 #[test]
 fn cursor_advance_to_next_leaf_crosses_nodes() {
     let (source, table) = build_int_table(500);
-    let mut cursor = Cursor::new(&table);
+    let mut cursor = RowCursor::new(&table);
     cursor.init(vec![], vec![]);
     cursor.advance_to_left(&source).unwrap();
     let mut visited = 0usize;
@@ -156,37 +149,24 @@ fn cursor_advance_to_next_leaf_crosses_nodes() {
 #[ignore]
 fn constraint_before_beginning_yields_nothing() {
     let (source, table) = build_int_table(10);
-    let mut cursor = Cursor::new(&table);
-    cursor.init(
-        vec![Constraint::new(0, ConstraintOp::Eq)],
-        vec![Value::Int(-100)],
-    );
+    let mut cursor = RowCursor::new(&table);
+    cursor.init(vec![Constraint::new(0, ConstraintOp::Eq)], vec![Value::Int(-100)]);
     cursor.advance_to_left(&source).unwrap();
     let ids = drain_row_ids(&mut cursor, &source, &table);
-    assert!(
-        ids.is_empty(),
-        "expected empty result for Eq=-100, got {:?}",
-        ids
-    );
+    assert!(ids.is_empty(), "expected empty result for Eq=-100, got {:?}", ids);
 }
 
 #[test]
 fn constraint_after_end_yields_nothing() {
     let (source, table) = build_int_table(10);
-    let mut cursor = Cursor::new(&table);
-    cursor.init(
-        vec![Constraint::new(0, ConstraintOp::Eq)],
-        vec![Value::Int(9999)],
-    );
+    let mut cursor = RowCursor::new(&table);
+    cursor.init(vec![Constraint::new(0, ConstraintOp::Eq)], vec![Value::Int(9999)]);
     cursor.advance_to_left(&source).unwrap();
     let ids = drain_row_ids(&mut cursor, &source, &table);
     assert!(ids.is_empty());
 
-    let mut cursor = Cursor::new(&table);
-    cursor.init(
-        vec![Constraint::new(0, ConstraintOp::Ge)],
-        vec![Value::Int(9999)],
-    );
+    let mut cursor = RowCursor::new(&table);
+    cursor.init(vec![Constraint::new(0, ConstraintOp::Ge)], vec![Value::Int(9999)]);
     cursor.advance_to_left(&source).unwrap();
     let ids = drain_row_ids(&mut cursor, &source, &table);
     assert!(ids.is_empty());

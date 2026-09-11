@@ -71,8 +71,8 @@ fn infer_row_schema_rejects_unsupported() {
 #[test]
 fn write_rejects_empty_input() {
     let mut w = NoopWriter::new();
-    let err = write_rows_to_prolly_tree(&mut w, "t".to_string(), vec![0], vec![], 64, 16, None)
-        .unwrap_err();
+    let err =
+        write_rows_to_prolly_tree(&mut w, "t".to_string(), vec![0], vec![], 64, 16, None).unwrap_err();
     match err {
         BeechError::Domain(DomainError::InvalidArgs(_)) => (),
         other => panic!("expected InvalidArgs, got {:?}", other),
@@ -89,8 +89,7 @@ fn write_rejects_unsupported_field_type() {
             ("xs".to_string(), Value::Array(vec![Value::Int(1)])),
         ]),
     )];
-    let err = write_rows_to_prolly_tree(&mut w, "t".to_string(), vec![0], rows, 64, 16, None)
-        .unwrap_err();
+    let err = write_rows_to_prolly_tree(&mut w, "t".to_string(), vec![0], rows, 64, 16, None).unwrap_err();
     match err {
         BeechError::Schema(SchemaError::UnsupportedFieldType { .. }) => (),
         other => panic!("expected UnsupportedFieldType, got {:?}", other),
@@ -104,8 +103,7 @@ fn write_rejects_duplicate_keys_in_input() {
         (1i64, int_record(5, 10)),
         (2i64, int_record(5, 20)), // same key
     ];
-    let err = write_rows_to_prolly_tree(&mut w, "t".to_string(), vec![0], rows, 64, 16, None)
-        .unwrap_err();
+    let err = write_rows_to_prolly_tree(&mut w, "t".to_string(), vec![0], rows, 64, 16, None).unwrap_err();
     match err {
         BeechError::Domain(DomainError::DuplicateKey { .. }) => (),
         other => panic!("expected DuplicateKey, got {:?}", other),

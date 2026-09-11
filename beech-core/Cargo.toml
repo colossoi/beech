@@ -4,21 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-apache-avro.workspace = true
-serde = {workspace = true, optional = true}
-serde_bytes.workspace = true
-serde-value.workspace = true
 thiserror.workspace = true
-ordered-float = "5.0.0"
-log = "0.4.27"
-beech-mem = { path = "../beech-mem" }
-#apache-avro-derive.workspace = true
-
-
-[features]
-default = ["serde"]
-serde = ["dep:serde"]
+arrow-array = "=59.3.0"
+arrow-schema = "=59.3.0"
+arrow-select = "=59.3.0"
+parquet = { version = "=59.3.0", default-features = false, features = ["arrow", "snap"] }
+bytes = "1.10"
+thrift = { version = "=0.24.0", default-features = false }
+sha2 = "0.10.9"
 
 [dev-dependencies]
-log = "0.4.27"
-simple_logger = "5.0.0"
+beech-shaper = { path = "../beech-shaper" }
+tempfile = "3"

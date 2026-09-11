@@ -210,10 +210,7 @@ fn replace_mode_load(
         None, // For the first transaction, no previous transaction
     )?;
 
-    info!(
-        "Successfully loaded {} records into new table",
-        records.len()
-    );
+    info!("Successfully loaded {} records into new table", records.len());
     info!("Transaction ID: {transaction_id}");
     info!("Table ID: {table_id}");
 
@@ -240,13 +237,8 @@ fn info_command(data_dir: PathBuf) -> anyhow::Result<()> {
 
     // Read the root file to get the current transaction ID
     let root_file_path = data_dir.join("root");
-    let transaction_id_str = std::fs::read_to_string(&root_file_path).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to read root file at {}: {}",
-            root_file_path.display(),
-            e
-        )
-    })?;
+    let transaction_id_str = std::fs::read_to_string(&root_file_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read root file at {}: {}", root_file_path.display(), e))?;
 
     let transaction_id = Id::from_hex(transaction_id_str.trim())?;
 
@@ -314,22 +306,17 @@ fn inspect_command(data_dir: Option<PathBuf>, node_id_or_path: String) -> anyhow
     use std::path::Path;
 
     // Determine if input is a file path or just a node ID
-    let (data_dir, node_id) = if node_id_or_path.contains('/') && node_id_or_path.ends_with(".bch")
-    {
+    let (data_dir, node_id) = if node_id_or_path.contains('/') && node_id_or_path.ends_with(".bch") {
         // Input is a file path - extract directory and node ID
         let path = Path::new(&node_id_or_path);
         let directory = path
             .parent()
-            .ok_or_else(|| {
-                anyhow::anyhow!("Cannot determine directory from path: {}", node_id_or_path)
-            })?
+            .ok_or_else(|| anyhow::anyhow!("Cannot determine directory from path: {}", node_id_or_path))?
             .to_path_buf();
 
         let file_stem = path
             .file_stem()
-            .ok_or_else(|| {
-                anyhow::anyhow!("Cannot extract filename from path: {}", node_id_or_path)
-            })?
+            .ok_or_else(|| anyhow::anyhow!("Cannot extract filename from path: {}", node_id_or_path))?
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("Invalid filename encoding: {}", node_id_or_path))?;
 
@@ -345,13 +332,8 @@ fn inspect_command(data_dir: Option<PathBuf>, node_id_or_path: String) -> anyhow
 
     // Read the root file to get the current transaction ID
     let root_file_path = data_dir.join("root");
-    let transaction_id_str = std::fs::read_to_string(&root_file_path).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to read root file at {}: {}",
-            root_file_path.display(),
-            e
-        )
-    })?;
+    let transaction_id_str = std::fs::read_to_string(&root_file_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read root file at {}: {}", root_file_path.display(), e))?;
 
     let transaction_id = Id::from_hex(transaction_id_str.trim())?;
 
@@ -402,15 +384,9 @@ fn inspect_command(data_dir: Option<PathBuf>, node_id_or_path: String) -> anyhow
 }
 
 fn read_csv_to_records(path: &PathBuf, has_headers: bool) -> anyhow::Result<Vec<(i64, Value)>> {
-    let mut reader = csv::ReaderBuilder::new()
-        .has_headers(has_headers)
-        .from_path(path)?;
+    let mut reader = csv::ReaderBuilder::new().has_headers(has_headers).from_path(path)?;
 
-    let headers = if has_headers {
-        Some(reader.headers()?.clone())
-    } else {
-        None
-    };
+    let headers = if has_headers { Some(reader.headers()?.clone()) } else { None };
 
     let mut records = Vec::new();
     for (row_id, record) in reader.records().enumerate() {
@@ -553,11 +529,9 @@ mod tests {
 
         // Check that data matches (may be in different order due to key sorting)
         for (original_row_id, original_record) in &test_rows {
-            let found = retrieved_rows
-                .iter()
-                .any(|(retrieved_row_id, retrieved_record)| {
-                    retrieved_row_id == original_row_id && retrieved_record == original_record
-                });
+            let found = retrieved_rows.iter().any(|(retrieved_row_id, retrieved_record)| {
+                retrieved_row_id == original_row_id && retrieved_record == original_record
+            });
             assert!(
                 found,
                 "Original row {:?} not found in retrieved rows",
@@ -575,14 +549,8 @@ mod tests {
         writer.write("data.bin", &[1, 2, 3, 4, 5]).unwrap();
 
         // Verify data can be retrieved
-        assert_eq!(
-            writer.get_file("test.txt"),
-            Some(b"Hello, World!".as_slice())
-        );
-        assert_eq!(
-            writer.get_file("data.bin"),
-            Some([1, 2, 3, 4, 5].as_slice())
-        );
+        assert_eq!(writer.get_file("test.txt"), Some(b"Hello, World!".as_slice()));
+        assert_eq!(writer.get_file("data.bin"), Some([1, 2, 3, 4, 5].as_slice()));
         assert_eq!(writer.get_file("nonexistent.txt"), None);
     }
 
@@ -613,7 +581,7 @@ mod tests {
 
     #[test]
     fn test_large_prolly_tree() {
-        use beech_core::query::{Constraint, ConstraintOp, Cursor};
+        use beech_core::query::{Constraint, ConstraintOp, RowCursor};
 
         // Create test data with a single numeric field - targeting 4 levels
         let num_rows = 15_000;
@@ -642,7 +610,7 @@ mod tests {
         let table = node_source.get_table(&transaction, "large_table").unwrap();
 
         // Test full scan with unbounded cursor
-        let mut cursor = Cursor::new(&table);
+        let mut cursor = RowCursor::new(&table);
         cursor.init(vec![], vec![]); // No constraints = unbounded
 
         // Navigate to the first leaf node
@@ -651,10 +619,7 @@ mod tests {
         // Test tree depth - expecting 3 levels with improved splitting algorithm
         let tree_depth = cursor.depth();
         debug!("Tree depth: {tree_depth} levels");
-        assert_eq!(
-            tree_depth, 3,
-            "Expected 3-level tree, got depth {tree_depth}"
-        );
+        assert_eq!(tree_depth, 3, "Expected 3-level tree, got depth {tree_depth}");
 
         // Test root node metadata - cursor depth 3 means root node depth 2 (since leaves are depth 0)
         if let Some(root_node_id) = &table.root {
@@ -713,7 +678,7 @@ mod tests {
         // Test bounded cursor with lower_bound
         let test_values = [1000, 5000, 9000];
         for &test_value in &test_values {
-            let mut bounded_cursor = Cursor::new(&table);
+            let mut bounded_cursor = RowCursor::new(&table);
             // Create constraint for value >= test_value
             let constraint = Constraint::new(0, ConstraintOp::Ge);
             bounded_cursor.init(vec![constraint], vec![Value::Long(test_value)]);

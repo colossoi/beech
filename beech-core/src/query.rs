@@ -1,407 +1,494 @@
-use crate::{Id, Key, Node, NodeSource, QueryError, Result, Table};
-use apache_avro::AvroSchema;
-use apache_avro::types::Value;
-use ordered_float::OrderedFloat;
-use serde::{Deserialize, Serialize};
-use std::cmp::Ordering;
-use std::vec::Vec;
+//! Key-ordered tree scans with column projection and exact residual filtering.
+use crate::error::{bail, beech_error};
+use crate::value::{ColumnStatistics, ScalarRef, prefix_cmp_at};
+use crate::{value::prefix_cmp, *};
+use arrow_array::{Array, BooleanArray};
+use arrow_select::filter::filter_record_batch;
+use std::{cmp::Ordering, collections::BTreeSet, ops::Bound};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, AvroSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
 pub enum ConstraintOp {
-    Eq,
-    Gt,
-    Le,
-    Lt,
-    Ge,
-    Unknown,
+    Unknown = 0,
+    Eq = 1,
+    Gt = 2,
+    Le = 3,
+    Lt = 4,
+    Ge = 5,
+    IsNull = 6,
+    IsNotNull = 7,
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize, AvroSchema)]
-pub struct Constraint {
-    pub column: i32, // TODO: Avro doesn't support unsigned  integers
-    pub op: ConstraintOp,
-    pub has_index: bool,
-}
-
-#[derive(Debug)]
-pub struct OrderBy {
+#[derive(Debug, Clone)]
+pub struct Predicate {
     pub column: usize,
-    pub desc: bool,
+    pub op: ConstraintOp,
+    pub value: Scalar,
 }
-
-#[derive(Debug)]
-pub struct Cursor {
-    stack: Vec<(Id, usize)>,
-    lower_bound: Option<Key>,
-    pub table: Table,
-    constraints: Vec<Vec<(Constraint, Value)>>, // one collection of constraints per key part
-}
-
-#[derive(Debug)]
-pub struct OrdValue<'a>(pub &'a Value);
-
-impl<'a> Eq for OrdValue<'a> {}
-impl<'a> PartialEq for OrdValue<'a> {
-    fn eq(&self, rhs: &Self) -> bool {
-        matches!(self.partial_cmp(rhs), Some(Ordering::Equal))
+impl Predicate {
+    pub fn new(column: usize, op: ConstraintOp, value: Scalar) -> Self {
+        Self { column, op, value }
     }
-}
-impl<'a> Ord for OrdValue<'a> {
-    fn cmp(&self, rhs: &OrdValue) -> Ordering {
-        match self.partial_cmp(rhs) {
-            None => Ordering::Equal,
-            Some(c) => c,
+    fn validate(&self, schema: &TableSchema) -> Result<()> {
+        let field = schema
+            .fields()
+            .get(self.column)
+            .ok_or_else(|| beech_error!(Query, "predicate column out of bounds"))?;
+        if self.op == ConstraintOp::Unknown {
+            bail!(Query, "unsupported predicate");
         }
-    }
-}
-impl<'a> PartialOrd for OrdValue<'a> {
-    fn partial_cmp(&self, rhs: &OrdValue) -> Option<Ordering> {
-        let (&OrdValue(lhs), &OrdValue(rhs)) = (self, rhs);
-        match lhs {
-            Value::Null => {
-                if *rhs == Value::Null {
-                    Some(Ordering::Equal)
-                } else {
-                    Some(Ordering::Less)
-                }
-            }
-            Value::Boolean(v0) => match rhs {
-                Value::Null => Some(Ordering::Greater),
-                Value::Boolean(v1) => Some(v0.cmp(v1)),
-                Value::Int(v1) => Some(v0.cmp(&(*v1 != 0))),
-                Value::Long(v1) => Some(v0.cmp(&(*v1 != 0))),
-                Value::Float(v1) => Some(v0.cmp(&(*v1 != 0.0))),
-                Value::Double(v1) => Some(v0.cmp(&(*v1 != 0.0))),
-                _ => None,
-            },
-            Value::Int(v0) => match rhs {
-                Value::Null => Some(Ordering::Greater),
-                Value::Boolean(v1) => Some((*v0 != 0).cmp(v1)),
-                Value::Int(v1) => Some(v0.cmp(v1)),
-                Value::Long(v1) => Some((i64::from(*v0)).cmp(v1)),
-                Value::Float(v1) => OrderedFloat(*v0 as f32).partial_cmp(&OrderedFloat(*v1)),
-                Value::Double(v1) => OrderedFloat(f64::from(*v0)).partial_cmp(&OrderedFloat(*v1)),
-                _ => None,
-            },
-            Value::Long(v0) => match rhs {
-                Value::Null => Some(Ordering::Greater),
-                Value::Boolean(v1) => Some((*v0 != 0).cmp(v1)),
-                Value::Int(v1) => Some(v0.cmp(&(i64::from(*v1)))),
-                Value::Long(v1) => Some(v0.cmp(v1)),
-                Value::Float(v1) => OrderedFloat(*v0 as f32).partial_cmp(&OrderedFloat(*v1)),
-                Value::Double(v1) => OrderedFloat(*v0 as f64).partial_cmp(&OrderedFloat(*v1)),
-                _ => None,
-            },
-            Value::Float(v0) => match rhs {
-                Value::Null => Some(Ordering::Greater),
-                Value::Boolean(v1) => Some((*v0 != 0.0).cmp(v1)),
-                Value::Int(v1) => OrderedFloat(*v0).partial_cmp(&OrderedFloat(*v1 as f32)),
-                Value::Long(v1) => OrderedFloat(*v0).partial_cmp(&OrderedFloat(*v1 as f32)),
-                Value::Float(v1) => OrderedFloat(*v0).partial_cmp(&OrderedFloat(*v1)),
-                Value::Double(v1) => OrderedFloat(f64::from(*v0)).partial_cmp(&OrderedFloat(*v1)),
-                _ => None,
-            },
-            Value::Double(v0) => match rhs {
-                Value::Null => Some(Ordering::Greater),
-                Value::Boolean(v1) => Some((*v0 != 0.0).cmp(v1)),
-                Value::Int(v1) => OrderedFloat(*v0).partial_cmp(&OrderedFloat(f64::from(*v1))),
-                Value::Long(v1) => OrderedFloat(*v0).partial_cmp(&OrderedFloat(*v1 as f64)),
-                Value::Float(v1) => OrderedFloat(*v0).partial_cmp(&OrderedFloat(f64::from(*v1))),
-                Value::Double(v1) => OrderedFloat(*v0).partial_cmp(&OrderedFloat(*v1)),
-                _ => None,
-            },
-            x => match (x, rhs) {
-                (Value::Bytes(v0), Value::Bytes(v1)) => Some(v0.cmp(v1)),
-                (Value::String(v0), Value::String(v1)) => Some(v0.cmp(v1)),
-                (Value::Fixed(sz0, v0), Value::Fixed(sz1, v1)) if sz0 == sz1 => Some(v0.cmp(v1)),
-                (Value::Enum(pos0, _), Value::Enum(pos1, _)) => Some(pos0.cmp(pos1)),
-                (_, _) => None,
-            },
+        if !matches!(self.op, ConstraintOp::IsNull | ConstraintOp::IsNotNull) {
+            self.value.validate_type(field.data_type(), true)?;
         }
-    }
-}
-
-impl Constraint {
-    pub fn new(column: i32, op: ConstraintOp) -> Self {
-        Constraint {
-            column,
-            op,
-            has_index: false,
-        }
-    }
-    fn before_beginning(&self, reference_val: &Value, current_val: &Value) -> bool {
-        if !self.has_index {
-            return false;
-        }
-
-        match self.op {
-            ConstraintOp::Gt | ConstraintOp::Eq | ConstraintOp::Ge => {
-                let ov1 = OrdValue(current_val);
-                let ov2 = OrdValue(reference_val);
-                ov1 < ov2 || (self.op == ConstraintOp::Gt && ov1 == ov2)
-            }
-            _ => false,
-        }
-    }
-
-    fn after_end(&self, reference_val: &Value, current_val: &Value) -> bool {
-        if !self.has_index {
-            return false;
-        }
-        match self.op {
-            ConstraintOp::Lt | ConstraintOp::Eq | ConstraintOp::Le => {
-                let ov1 = OrdValue(current_val);
-                let ov2 = OrdValue(reference_val);
-                ov1 > ov2 || (self.op == ConstraintOp::Lt && ov1 == ov2)
-            }
-            _ => false,
-        }
-    }
-}
-impl Cursor {
-    pub fn new(t: &Table) -> Self {
-        Cursor {
-            stack: vec![],
-            table: t.clone(),
-            lower_bound: None,
-            constraints: vec![],
-        }
-    }
-
-    pub fn init(&mut self, constraints: Vec<Constraint>, values: Vec<Value>) {
-        let key_size = self.table.key_columns.len();
-        let mut bound_constraints: Vec<Vec<(Constraint, Value)>> =
-            vec![Default::default(); key_size];
-        for (mut c, v) in constraints.into_iter().zip(values) {
-            if let Some(key_part_index) = self.table.column_key_index(c.column as usize) {
-                c.has_index = true;
-                if let Some(slot) = bound_constraints.get_mut(key_part_index) {
-                    slot.push((c, v));
-                }
-            }
-        }
-        self.constraints = bound_constraints;
-        self.lower_bound = None;
-        self.stack = self
-            .table
-            .root
-            .as_ref()
-            .map_or(Vec::new(), |r| vec![(r.clone(), 0)]);
-    }
-
-    /// Advance cursor to the next leaf node.
-    /// This is used when processing changes leaf by leaf.
-    pub fn advance_to_next_leaf(&mut self, source: &dyn NodeSource) -> Result<()> {
-        // Move to the next position using existing logic
-        self.advance_stack(source)?;
-        self.advance_to_left(source)?;
-
-        // Check if we've moved beyond our constraints
-        if let Some((id, slot)) = &self.stack.last() {
-            let p = source.get_node(id, &self.table.schema)?;
-            if let Some(key) = p.keys().get(*slot) {
-                if self.done_iterating(key) {
-                    self.stack.clear();
-                }
-            }
-        }
-
         Ok(())
     }
+    fn matches(&self, value: ScalarRef<'_>) -> Result<bool> {
+        if self.op == ConstraintOp::IsNull {
+            return Ok(value.is_null());
+        }
+        if self.op == ConstraintOp::IsNotNull {
+            return Ok(!value.is_null());
+        }
+        if value.is_null() || self.value.is_null() {
+            return Ok(false);
+        }
+        // Predicates use numeric float semantics; keys use IEEE total ordering.
+        let cmp = match (value, &self.value) {
+            (ScalarRef::Float32(a), Scalar::Float32(b)) => a.partial_cmp(b),
+            (ScalarRef::Float64(a), Scalar::Float64(b)) => a.partial_cmp(b),
+            _ => Some(value.compare(&self.value.as_ref())?),
+        };
+        Ok(cmp.is_some_and(|o| match self.op {
+            ConstraintOp::Eq => o == Ordering::Equal,
+            ConstraintOp::Lt => o == Ordering::Less,
+            ConstraintOp::Le => o != Ordering::Greater,
+            ConstraintOp::Gt => o == Ordering::Greater,
+            ConstraintOp::Ge => o != Ordering::Less,
+            _ => false,
+        }))
+    }
+    fn may_match(&self, stats: &ColumnStatistics, row_count: u64) -> Result<bool> {
+        if !matches!(self.op, ConstraintOp::IsNull | ConstraintOp::IsNotNull) && self.value.is_null() {
+            return Ok(false);
+        }
+        let nulls = stats.null_count;
+        if self.op == ConstraintOp::IsNull {
+            return Ok(nulls != Some(0));
+        }
+        if nulls == Some(row_count) {
+            return Ok(false);
+        }
+        if self.op == ConstraintOp::IsNotNull {
+            return Ok(true);
+        }
+        let Some((min, max)) = &stats.bounds else {
+            return Ok(true);
+        };
+        if min.compare(max)? == Ordering::Greater {
+            return Ok(true);
+        }
+        let min_cmp = min.compare(&self.value)?;
+        let max_cmp = max.compare(&self.value)?;
+        Ok(match self.op {
+            ConstraintOp::Eq => min_cmp != Ordering::Greater && max_cmp != Ordering::Less,
+            ConstraintOp::Lt => min_cmp == Ordering::Less,
+            ConstraintOp::Le => min_cmp != Ordering::Greater,
+            ConstraintOp::Gt => max_cmp == Ordering::Greater,
+            ConstraintOp::Ge => max_cmp != Ordering::Less,
+            _ => true,
+        })
+    }
+}
 
-    pub fn advance_to_right(&mut self, source: &dyn NodeSource) -> Result<()> {
-        loop {
-            match self.stack.pop() {
-                Some((id, _)) => {
-                    let p = source.get_node(&id, &self.table.schema)?;
-                    match &*p {
-                        Node::Internal(internal) => {
-                            let Some(last) = internal.len().checked_sub(1) else {
-                                return Ok(());
-                            };
-                            self.stack.push((id, last));
-                            self.stack.push((internal.children[last].clone(), 0));
-                        }
-                        Node::Leaf(leaf) => {
-                            let Some(last) = leaf.len().checked_sub(1) else {
-                                return Ok(());
-                            };
-                            self.stack.push((id, last));
-                            return Ok(());
-                        }
+/// A bound may be a full key or a prefix. `Included([a])` includes every `(a, ...)`.
+#[derive(Debug, Clone)]
+pub struct KeyRange {
+    pub lower: Bound<Key>,
+    pub upper: Bound<Key>,
+}
+impl Default for KeyRange {
+    fn default() -> Self {
+        Self {
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+        }
+    }
+}
+impl KeyRange {
+    pub fn prefix(key: Key) -> Self {
+        Self {
+            lower: Bound::Included(key.clone()),
+            upper: Bound::Included(key),
+        }
+    }
+    fn validate(&self, schema: &TableSchema) -> Result<()> {
+        for bound in [&self.lower, &self.upper] {
+            if let Bound::Included(k) | Bound::Excluded(k) = bound {
+                schema.validate_key(k, true)?;
+            }
+        }
+        Ok(())
+    }
+    fn contains(&self, columns: &[&dyn Array], row: usize) -> Result<bool> {
+        let lower = match &self.lower {
+            Bound::Unbounded => true,
+            Bound::Included(k) => prefix_cmp_at(columns, row, k)? != Ordering::Less,
+            Bound::Excluded(k) => prefix_cmp_at(columns, row, k)? == Ordering::Greater,
+        };
+        let upper = match &self.upper {
+            Bound::Unbounded => true,
+            Bound::Included(k) => prefix_cmp_at(columns, row, k)? != Ordering::Greater,
+            Bound::Excluded(k) => prefix_cmp_at(columns, row, k)? == Ordering::Less,
+        };
+        Ok(lower && upper)
+    }
+    fn intersects(&self, max: &Key, lower_exclusive: Option<&Key>) -> Result<bool> {
+        let after_lower = match &self.lower {
+            Bound::Unbounded => true,
+            Bound::Included(k) => prefix_cmp(max, k)? != Ordering::Less,
+            Bound::Excluded(k) => prefix_cmp(max, k)? == Ordering::Greater,
+        };
+        if !after_lower {
+            return Ok(false);
+        }
+        if let Some(low) = lower_exclusive {
+            match &self.upper {
+                Bound::Unbounded => {}
+                Bound::Excluded(k) => {
+                    if prefix_cmp(low, k)? != Ordering::Less {
+                        return Ok(false);
                     }
                 }
-                None => return Ok(()),
+                Bound::Included(k) => {
+                    let cmp = prefix_cmp(low, k)?;
+                    if cmp == Ordering::Greater || (cmp == Ordering::Equal && k.len() == low.len()) {
+                        return Ok(false);
+                    }
+                }
             }
         }
+        Ok(true)
     }
-    pub fn advance_to_left(&mut self, source: &dyn NodeSource) -> Result<()> {
-        while let Some((id, slot)) = &self.stack.pop() {
-            let p = source.get_node(id, &self.table.schema)?;
-            if let Some(new_slot) = self.find_next_slot(&p, *slot) {
-                self.stack.push((id.clone(), new_slot));
-                if let Node::Internal(internal) = &*p {
-                    let new_child_id = internal.child_at(new_slot).ok_or_else(|| {
-                        QueryError::ChildIndexOutOfBounds {
-                            index: new_slot,
-                            len: internal.children.len(),
-                        }
-                    })?;
-                    self.stack.push((new_child_id.clone(), 0));
-                } else {
-                    // We've reached a leaf node
-                    break;
-                }
-            } else {
-                self.advance_stack(source)?;
-            }
+}
+/// User columns are zero-based and returned in this exact order.
+#[derive(Debug, Clone)]
+pub struct ScanRequest {
+    pub projection: Vec<usize>,
+    pub include_row_id: bool,
+    pub predicates: Vec<Predicate>,
+    pub range: KeyRange,
+    pub batch_size: usize,
+    #[cfg(test)]
+    pub(crate) use_statistics: bool,
+}
+impl ScanRequest {
+    pub fn all(table: &Table) -> Self {
+        Self {
+            projection: (0..table.schema.fields().len()).collect(),
+            include_row_id: false,
+            predicates: vec![],
+            range: KeyRange::default(),
+            batch_size: 1024,
+            #[cfg(test)]
+            use_statistics: true,
+        }
+    }
+    /// Check a concrete scan request against its table before execution.
+    pub fn validate(&self, table: &Table) -> Result<()> {
+        table.validate()?;
+        self.range.validate(&table.schema)?;
+        if self.batch_size == 0 {
+            bail!(Query, "batch size must be positive");
+        }
+        let columns: BTreeSet<_> = self.projection.iter().copied().collect();
+        if columns.len() != self.projection.len()
+            || columns.iter().any(|&c| c >= table.schema.fields().len())
+        {
+            bail!(Query, "duplicate or invalid projection column");
+        }
+        for predicate in &self.predicates {
+            predicate.validate(&table.schema)?;
         }
         Ok(())
     }
-
-    fn find_next_slot(&mut self, p: &Node, starting_slot: usize) -> Option<usize> {
-        let keys = p.keys();
-        let s = &keys[starting_slot..];
-        let location_result = s.binary_search_by(|e| {
-            if self.should_skip(&self.lower_bound, e) {
-                self.lower_bound = Some(e.clone());
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            }
-        });
-        // we're abusing the binary search function a bit, relying on this
-        // in its documentation: "If the value is not found then
-        // Result::Err is returned, containing the index where a matching
-        // element could be inserted"
-        // since our predicate above never returns "Equal", binary_search_by
-        // should always return Err
-        let loc = location_result.unwrap_err();
-        let new_loc = loc + starting_slot;
-        if new_loc >= keys.len() && p.is_leaf() {
-            None
-        } else {
-            Some(new_loc)
+}
+#[derive(Debug, Clone, Default)]
+pub struct ScanMetrics {
+    pub internal_nodes: usize,
+    pub leaves: usize,
+    pub pruned_nodes: usize,
+    pub pruned_leaves: usize,
+    pub output_rows: usize,
+}
+struct Pending {
+    reference: NodeRef,
+    lower: Option<Key>,
+}
+pub struct Scan<'a> {
+    source: &'a dyn NodeSource,
+    table: Table,
+    request: ScanRequest,
+    ranges: Vec<KeyRange>,
+    pending: Vec<Pending>,
+    current: Option<storage::LeafBatches>,
+    physical: Vec<usize>,
+    finished: bool,
+    metrics: ScanMetrics,
+}
+fn predicate_range(schema: &TableSchema, predicates: &[Predicate]) -> KeyRange {
+    let mut prefix = vec![];
+    for &col in schema.key_columns() {
+        if matches!(
+            schema.fields()[col].data_type(),
+            DataType::Float32 | DataType::Float64
+        ) {
+            break;
         }
+        if let Some(p) =
+            predicates.iter().find(|p| p.column == col && p.op == ConstraintOp::Eq && !p.value.is_null())
+        {
+            prefix.push(p.value.clone());
+            continue;
+        }
+        let mut range =
+            if prefix.is_empty() { KeyRange::default() } else { KeyRange::prefix(prefix.clone()) };
+        if let Some(p) = predicates.iter().find(|p| {
+            p.column == col && matches!(p.op, ConstraintOp::Gt | ConstraintOp::Ge) && !p.value.is_null()
+        }) {
+            let mut k = prefix.clone();
+            k.push(p.value.clone());
+            range.lower = if p.op == ConstraintOp::Gt { Bound::Excluded(k) } else { Bound::Included(k) };
+        }
+        if let Some(p) = predicates.iter().find(|p| {
+            p.column == col && matches!(p.op, ConstraintOp::Lt | ConstraintOp::Le) && !p.value.is_null()
+        }) {
+            let mut k = prefix.clone();
+            k.push(p.value.clone());
+            range.upper = if p.op == ConstraintOp::Lt { Bound::Excluded(k) } else { Bound::Included(k) };
+        }
+        return range;
     }
-
-    fn advance_stack(&mut self, source: &dyn NodeSource) -> Result<()> {
-        while !self.stack.is_empty() {
-            match &self.stack.pop() {
-                Some((id, slot)) => {
-                    let (last_slot, new_lower_bound) = {
-                        let p = source.get_node(id, &self.table.schema)?;
-                        (p.last_slot_index(), p.keys().get(*slot).cloned())
-                    };
-                    self.lower_bound = new_lower_bound;
-                    if let Some(last_slot) = last_slot {
-                        if *slot < last_slot {
-                            self.stack.push((id.clone(), slot + 1));
+    if prefix.is_empty() { KeyRange::default() } else { KeyRange::prefix(prefix) }
+}
+impl<'a> Scan<'a> {
+    pub fn metrics(&self) -> &ScanMetrics {
+        &self.metrics
+    }
+    pub fn new(source: &'a dyn NodeSource, table: &Table, request: ScanRequest) -> Result<Self> {
+        request.validate(table)?;
+        let columns: BTreeSet<_> = request.projection.iter().copied().collect();
+        let mut physical: BTreeSet<usize> = columns.iter().map(|i| i + 1).collect();
+        if request.include_row_id {
+            physical.insert(0);
+        }
+        for &key in table.schema.key_columns() {
+            physical.insert(key + 1);
+        }
+        for p in &request.predicates {
+            physical.insert(p.column + 1);
+        }
+        let ranges = vec![
+            request.range.clone(),
+            predicate_range(&table.schema, &request.predicates),
+        ];
+        let pending = table
+            .root
+            .iter()
+            .map(|r| Pending {
+                reference: r.clone(),
+                lower: None,
+            })
+            .collect();
+        Ok(Self {
+            source,
+            table: table.clone(),
+            request,
+            ranges,
+            pending,
+            current: None,
+            physical: physical.into_iter().collect(),
+            finished: false,
+            metrics: ScanMetrics::default(),
+        })
+    }
+    fn matches_node(&self, p: &Pending) -> Result<bool> {
+        for r in &self.ranges {
+            if !r.intersects(&p.reference.max_key, p.lower.as_ref())? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    fn projected_slot(&self, physical: usize) -> Result<usize> {
+        self.physical.binary_search(&physical).map_err(|_| beech_error!(Query, "missing scan column"))
+    }
+    fn filter_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let key_columns = self
+            .table
+            .schema
+            .key_columns()
+            .iter()
+            .map(|&c| Ok(batch.column(self.projected_slot(c + 1)?).as_ref()))
+            .collect::<Result<Vec<_>>>()?;
+        let mut mask = Vec::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            let mut keep = true;
+            for r in &self.ranges {
+                if !r.contains(&key_columns, row)? {
+                    keep = false;
+                    break;
+                }
+            }
+            if keep {
+                for p in &self.request.predicates {
+                    let value = ScalarRef::from_array(
+                        batch.column(self.projected_slot(p.column + 1)?).as_ref(),
+                        row,
+                    )?;
+                    if !p.matches(value)? {
+                        keep = false;
+                        break;
+                    }
+                }
+            }
+            mask.push(keep);
+        }
+        let filtered = filter_record_batch(batch, &BooleanArray::from(mask))?;
+        let mut output = vec![];
+        if self.request.include_row_id {
+            output.push(self.projected_slot(0)?);
+        }
+        for &c in &self.request.projection {
+            output.push(self.projected_slot(c + 1)?);
+        }
+        Ok(filtered.project(&output)?)
+    }
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        loop {
+            if let Some(reader) = &mut self.current {
+                if let Some(batch) = reader.next() {
+                    let batch = self.filter_batch(&batch?)?;
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    self.metrics.output_rows += batch.num_rows();
+                    return Ok(Some(batch));
+                }
+                self.current = None;
+            }
+            let Some(pending) = self.pending.pop() else {
+                return Ok(None);
+            };
+            if !self.matches_node(&pending)? {
+                self.metrics.pruned_nodes += 1;
+                continue;
+            }
+            if pending.reference.height > 0 {
+                let node = self.source.get_internal(&pending.reference, &self.table.schema)?;
+                self.metrics.internal_nodes += 1;
+                let mut children = vec![];
+                let mut lower = pending.lower;
+                for child in &node.children {
+                    children.push(Pending {
+                        reference: child.clone(),
+                        lower: lower.clone(),
+                    });
+                    lower = Some(child.max_key.clone());
+                }
+                self.pending.extend(children.into_iter().rev());
+            } else {
+                let leaf = self.source.open_leaf(&pending.reference, &self.table.schema)?;
+                self.metrics.leaves += 1;
+                let mut keep = true;
+                #[cfg(test)]
+                let use_statistics = self.request.use_statistics;
+                #[cfg(not(test))]
+                let use_statistics = true;
+                if use_statistics {
+                    for predicate in &self.request.predicates {
+                        if !predicate.may_match(leaf.statistics(predicate.column), leaf.row_count())? {
+                            keep = false;
                             break;
                         }
                     }
                 }
-                None => return Err(QueryError::EmptyStack.into()),
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn next(&mut self, source: &dyn NodeSource) -> Result<()> {
-        self.advance_stack(source)?;
-        self.advance_to_left(source)?;
-        if let Some((id, slot)) = &self.stack.last() {
-            let p = source.get_node(id, &self.table.schema)?;
-            if let Some(key) = p.keys().get(*slot) {
-                if self.done_iterating(key) {
-                    self.stack.clear();
-                }
-            }
-        };
-        Ok(())
-    }
-
-    pub fn current(&self) -> Option<&(Id, usize)> {
-        self.stack.last()
-    }
-
-    // positive number counts up from the bottom of the stack
-    pub fn stack_level(&self, lvl: isize) -> Option<&(Id, usize)> {
-        if lvl <= 0 {
-            let levels_down = -lvl as usize;
-            if levels_down >= self.stack.len() {
-                None
-            } else {
-                self.stack.get(self.stack.len() - levels_down - 1)
-            }
-        } else {
-            self.stack.get(lvl as usize)
-        }
-    }
-
-    pub fn eof(&self) -> bool {
-        self.stack.is_empty()
-    }
-
-    pub fn depth(&self) -> usize {
-        self.stack.len()
-    }
-
-    fn should_skip(&self, maybe_k_start: &Option<Key>, k_end: &Key) -> bool {
-        let maybe_k_start = maybe_k_start.as_ref();
-        // first thing to determine is which keyparts are in-order
-        // in the subtree bounded by k_start and k_end
-        // if there is no k_start, the only one that can be assumed
-        // to be in order is the first
-        let in_order_depth = maybe_k_start
-            .as_ref()
-            .map(|k_start| {
-                let klen = k_start.len();
-                let mut kiter = k_start.iter().zip(k_end).enumerate();
-                kiter
-                    .find_map(|(i, (ka, kb))| {
-                        if OrdValue(ka) != OrdValue(kb) {
-                            Some(i + 1)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(klen)
-            })
-            .unwrap_or(1);
-
-        for (i, (cs, end_part)) in self
-            .constraints
-            .iter()
-            .take(in_order_depth)
-            .zip(k_end)
-            .enumerate()
-        {
-            for (c, v) in cs {
-                if let Some(start_part) = maybe_k_start.and_then(|k_start| k_start.get(i)) {
-                    if c.after_end(v, start_part) {
-                        return true;
-                    }
-                }
-                if c.before_beginning(v, end_part) {
-                    return true;
+                if keep {
+                    self.current = Some(leaf.read(&self.physical, self.request.batch_size)?);
+                } else {
+                    self.metrics.pruned_leaves += 1;
                 }
             }
         }
-        false
-    }
-
-    fn done_iterating(&self, k: &Key) -> bool {
-        k.first()
-            .map(|kv| {
-                let first_constraints = &self.constraints[0];
-                first_constraints.iter().any(|(c, v)| c.after_end(v, kv))
-            })
-            .unwrap_or(false)
     }
 }
+impl Iterator for Scan<'_> {
+    type Item = Result<RecordBatch>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        match self.next_batch() {
+            Ok(Some(b)) => Some(Ok(b)),
+            Ok(None) => {
+                self.finished = true;
+                None
+            }
+            Err(e) => {
+                self.finished = true;
+                self.pending.clear();
+                self.current = None;
+                Some(Err(e))
+            }
+        }
+    }
+}
+impl std::iter::FusedIterator for Scan<'_> {}
 
-#[cfg(test)]
-#[path = "query_tests.rs"]
-mod tests;
+/// Materialize rows only at this adapter boundary. Batch scans remain column-oriented.
+pub struct RowCursor<'a> {
+    scan: Scan<'a>,
+    batch: Option<RecordBatch>,
+    row: usize,
+}
+impl<'a> RowCursor<'a> {
+    pub fn new(source: &'a dyn NodeSource, table: &Table, predicates: Vec<Predicate>) -> Result<Self> {
+        let mut request = ScanRequest::all(table);
+        request.include_row_id = true;
+        request.predicates = predicates;
+        Ok(Self {
+            scan: Scan::new(source, table, request)?,
+            batch: None,
+            row: 0,
+        })
+    }
+}
+impl Iterator for RowCursor<'_> {
+    type Item = Result<Row>;
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(batch) = &self.batch
+                && self.row < batch.num_rows()
+            {
+                let row = self.row;
+                self.row += 1;
+                return Some((|| {
+                    let Scalar::Int64(id) = Scalar::from_array(batch.column(0).as_ref(), row)? else {
+                        bail!(Schema, "invalid row ID");
+                    };
+                    let values = batch.columns()[1..]
+                        .iter()
+                        .map(|a| Scalar::from_array(a.as_ref(), row))
+                        .collect::<Result<_>>()?;
+                    Ok((id, values))
+                })());
+            }
+            match self.scan.next() {
+                Some(Ok(batch)) => {
+                    self.batch = Some(batch);
+                    self.row = 0;
+                }
+                Some(Err(e)) => return Some(Err(e)),
+                None => return None,
+            }
+        }
+    }
+}

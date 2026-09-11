@@ -94,11 +94,7 @@ fn is_complete_saturates_at_huge_elapsed() {
     for stream_idx in 0..32u32 {
         let mut s = ProbShaper::new(target, 50);
         let _ = s.is_complete(&stream_idx.to_le_bytes());
-        assert!(
-            s.is_complete(&huge),
-            "shaper {} failed to saturate",
-            stream_idx
-        );
+        assert!(s.is_complete(&huge), "shaper {} failed to saturate", stream_idx);
     }
 }
 

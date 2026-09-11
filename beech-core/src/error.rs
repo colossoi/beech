@@ -1,126 +1,66 @@
-use crate::{Id, Key};
-use std::path::PathBuf;
+use crate::Id;
 use thiserror::Error;
 
-#[derive(Debug, Error)]
-pub enum StorageError {
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("mmap failure at {path}: {source}")]
-    Mmap {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("{key_kind} not found in store: {key}")]
-    KeyNotFound { key_kind: &'static str, key: Id },
+// Construct a message-bearing error using format! syntax. Keeping this separate
+// from bail! also supports map_err/ok_or_else closures and tail expressions.
+// Examples:
+//   beech_error!(Schema, "column {column}: expected {}, found {actual:?}", expected)
+//   value.ok_or_else(|| beech_error!(Wire, "missing {field}"))?
+// These helpers target String-bearing variants; typed payloads such as IDs use
+// their constructors directly.
+macro_rules! beech_error {
+    ($variant:ident, $($args:tt)+) => {
+        $crate::BeechError::$variant(::std::format!($($args)+))
+    };
 }
 
-impl StorageError {
-    pub fn key_not_found(key_kind: &'static str, key: Id) -> Self {
-        StorageError::KeyNotFound { key_kind, key }
-    }
+// Return early with a formatted error; use the same variant/message syntax.
+//   bail!(InvalidNode, "node {id}: invalid height {height}");
+macro_rules! bail {
+    ($variant:ident, $($args:tt)+) => {
+        return ::core::result::Result::Err($crate::error::beech_error!($variant, $($args)+))
+    };
 }
 
-#[derive(Debug, Error)]
-pub enum WireError {
-    #[error("avro error: {0}")]
-    Avro(#[from] apache_avro::Error),
-    #[error("malformed wire data: {0}")]
-    Malformed(&'static str),
-    #[error("unexpected type: expected {expected}, got {got}")]
-    UnexpectedType {
-        expected: &'static str,
-        got: &'static str,
-    },
-    #[error("invalid hex: {0}")]
-    InvalidHex(String),
-    #[error("invalid utf-8: {0}")]
-    InvalidUtf8(#[from] std::str::Utf8Error),
-    #[error("truncated wire data")]
-    Truncated,
-}
-
-#[derive(Debug, Error)]
-pub enum SchemaError {
-    #[error("schema mismatch: {0}")]
-    Mismatch(String),
-    #[error("unsupported field type: {name} ({schema})")]
-    UnsupportedFieldType { name: String, schema: String },
-    #[error("invalid union schema: {0}")]
-    InvalidUnion(String),
-    #[error("missing key column: {name}")]
-    MissingKeyColumn { name: String },
-    #[error("arity mismatch: expected {expected}, got {got}")]
-    ArityMismatch { expected: usize, got: usize },
-}
-
-impl SchemaError {
-    pub fn unsupported_field(name: &str, value: &apache_avro::types::Value) -> Self {
-        SchemaError::UnsupportedFieldType {
-            name: name.to_string(),
-            schema: format!("{value:?}"),
-        }
-    }
-}
-
-#[derive(Debug, Error)]
-pub enum DomainError {
-    #[error("duplicate key: {key:?}")]
-    DuplicateKey { key: Key },
-    #[error("key not found: {key:?}")]
-    KeyNotFound { key: Key },
-    #[error("no such table: {name}")]
-    NoSuchTable { name: String },
-    #[error("invalid argument(s): {0}")]
-    InvalidArgs(String),
-}
-
-#[derive(Debug, Error)]
-pub enum QueryError {
-    #[error("cursor stack empty")]
-    EmptyStack,
-    #[error("child index out of bounds: index {index}, len {len}")]
-    ChildIndexOutOfBounds { index: usize, len: usize },
-    #[error("unexpected node type: expected {expected}, got {got}")]
-    UnexpectedNodeType {
-        expected: &'static str,
-        got: &'static str,
-    },
-    #[error("tree invariant violated: {0}")]
-    Malformed(&'static str),
-}
+pub(crate) use {bail, beech_error};
 
 #[derive(Debug, Error)]
 pub enum BeechError {
-    #[error(transparent)]
-    Storage(#[from] StorageError),
-    #[error(transparent)]
-    Wire(#[from] WireError),
-    #[error(transparent)]
-    Schema(#[from] SchemaError),
-    #[error(transparent)]
-    Domain(#[from] DomainError),
-    #[error(transparent)]
-    Query(#[from] QueryError),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Parquet error: {0}")]
+    Parquet(#[from] parquet::errors::ParquetError),
+    #[error("Arrow error: {0}")]
+    Arrow(#[from] arrow_schema::ArrowError),
+    #[error("Thrift error: {0}")]
+    Thrift(#[from] thrift::Error),
+    #[error("invalid 32-byte object ID")]
+    InvalidId,
+    #[error("schema error: {0}")]
+    Schema(String),
+    #[error("invalid node: {0}")]
+    InvalidNode(String),
+    #[error("invalid wire data: {0}")]
+    Wire(String),
+    #[error("query error: {0}")]
+    Query(String),
+    #[error("object not found: {0}")]
+    NotFound(Id),
+    #[error("no such table: {0}")]
+    NoSuchTable(String),
+    #[error("content hash mismatch for {0}")]
+    HashMismatch(Id),
 }
-
-impl From<std::io::Error> for BeechError {
-    fn from(e: std::io::Error) -> Self {
-        BeechError::Storage(StorageError::Io(e))
+impl BeechError {
+    // Add identity at the loading boundary, where an internal node's ID is known.
+    // Preserve validation categories and leave typed errors (and their causes) intact.
+    pub(crate) fn with_node_context(self, id: Id) -> Self {
+        match self {
+            Self::InvalidNode(message) => beech_error!(InvalidNode, "node {id}: {message}"),
+            Self::Schema(message) => beech_error!(Schema, "node {id}: {message}"),
+            Self::Wire(message) => beech_error!(Wire, "node {id}: {message}"),
+            other => other,
+        }
     }
 }
-
-impl From<apache_avro::Error> for BeechError {
-    fn from(e: apache_avro::Error) -> Self {
-        BeechError::Wire(WireError::Avro(e))
-    }
-}
-
-impl From<std::str::Utf8Error> for BeechError {
-    fn from(e: std::str::Utf8Error) -> Self {
-        BeechError::Wire(WireError::InvalidUtf8(e))
-    }
-}
-
 pub type Result<T> = std::result::Result<T, BeechError>;

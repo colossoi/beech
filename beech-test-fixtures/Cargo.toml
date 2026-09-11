@@ -5,6 +5,5 @@ edition = "2021"
 publish = false
 
 [dependencies]
-apache-avro.workspace = true
 beech-core = { path = "../beech-core" }
 beech-write = { path = "../beech-write" }
