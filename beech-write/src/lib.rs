@@ -2,6 +2,8 @@
 mod file;
 mod rows;
 mod snapshot;
+mod stats;
+pub use stats::TransactionStats;
 mod transaction;
 mod tree;
 mod update;

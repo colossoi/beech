@@ -1,4 +1,4 @@
-use crate::{BuildOptions, Change, ObjectSink};
+use crate::{BuildOptions, Change, ObjectSink, TransactionStats};
 use beech_core::{
     codec::thrift::{decode_key, encode_key},
     BeechError, Id, Key, KeyOrdering, NodeRef, NodeSource, Result, Row, Scalar, Table, TableSchema,
@@ -11,29 +11,37 @@ use std::{
 };
 
 type ChangeOrder = fn(&Change, &Change) -> Ordering;
-pub(crate) type SortedChanges = Box<dyn Iterator<Item = io::Result<Change>>>;
 
-/// Incoming changes are validated and spooled immediately. Sorting and tree
-/// editing read this spool; transaction-sized row collections are never needed.
+/// Incoming changes are validated and spooled immediately. Updates process the
+/// spool in submission order; bulk creation sorts it. A failed push discards the
+/// workspace and makes this transaction unusable.
 pub struct Transaction {
-    pub(crate) workspace: Workspace,
     schema: TableSchema,
-    input: Spool,
+    // None means a failed push has discarded the transaction scratch files.
+    scratch: Option<(Spool, Workspace)>,
     sort_limits: SortLimits,
     max_row_id: Option<i64>,
 }
 impl Transaction {
+    /// Sort limits apply to bulk creation only.
     pub fn new(schema: TableSchema, sort_limits: SortLimits) -> Result<Self> {
         let workspace = Workspace::new()?;
         Ok(Self {
-            input: Spool::new(&workspace)?,
-            workspace,
+            scratch: Some((Spool::new(&workspace)?, workspace)),
             schema,
             sort_limits,
             max_row_id: None,
         })
     }
     pub fn push(&mut self, change: Change) -> Result<()> {
+        let result = self.push_inner(change);
+        if result.is_err() {
+            self.scratch = None;
+        }
+        result
+    }
+    fn push_inner(&mut self, change: Change) -> Result<()> {
+        let (input, _) = self.scratch.as_mut().ok_or_else(failed)?;
         self.schema.validate_key(change.key(), false)?;
         if let Change::Insert { key, row_id, record } | Change::Update { key, row_id, record } = &change {
             if self.schema.key_from_row(&(*row_id, record.clone()))?.compare_key(key)? != Ordering::Equal {
@@ -41,21 +49,26 @@ impl Transaction {
             }
             self.max_row_id = Some(self.max_row_id.map_or(*row_id, |old| old.max(*row_id)));
         }
-        self.input.append(|writer| change.write(writer))?;
+        input.append(|writer| change.write(writer))?;
         Ok(())
     }
     fn sorted(&mut self) -> Result<SortedRuns<Change, ChangeOrder>> {
+        let (input, workspace) = self.scratch.as_mut().ok_or_else(failed)?;
         let compare: ChangeOrder = |a, b| a.key().compare_key(b.key()).expect("schema-validated keys");
         let mut sort = ExternalSort::new(
-            &self.workspace,
+            workspace,
             self.sort_limits,
             compare,
             Change::write,
             Change::read,
             Change::memory_size,
         );
-        for change in records(self.input.reader()?, Change::read) {
-            sort.push(change?)?;
+        for change in records(input.reader()?, Change::read) {
+            let change = change?;
+            if !matches!(change, Change::Insert { .. }) {
+                return Err(BeechError::Query("new tables require insert changes".into()));
+            }
+            sort.push(change)?;
         }
         let mut sorted = sort.finish()?;
         let mut previous: Option<Key> = None;
@@ -71,30 +84,43 @@ impl Transaction {
         }
         Ok(sorted)
     }
+    /// Apply ordered mutations privately, then stage only final reachable nodes.
+    /// On error, discard the sink/writer; finalization may have staged objects.
     pub fn apply(
-        mut self,
+        self,
         table: &Table,
         source: &impl NodeSource,
         sink: &mut impl ObjectSink,
         options: BuildOptions,
     ) -> Result<Table> {
+        self.apply_with_stats(table, source, sink, options).map(|(table, _)| table)
+    }
+    /// Apply ordered mutations and return their measured costs. See
+    /// [`TransactionStats`] for accounting scope; publication is measured separately.
+    pub fn apply_with_stats(
+        mut self,
+        table: &Table,
+        source: &impl NodeSource,
+        sink: &mut impl ObjectSink,
+        options: BuildOptions,
+    ) -> Result<(Table, TransactionStats)> {
         if table.schema() != &self.schema {
             return Err(BeechError::Schema(
                 "transaction schema does not match table".into(),
             ));
         }
-        let mut changes = self.sorted()?;
-        if changes.is_empty() {
-            return Ok(table.clone());
-        }
+        let (mut input, workspace) = self.scratch.take().ok_or_else(failed)?;
         let mut updated = table.clone();
         if let Some(id) = self.max_row_id {
             updated = updated.with_max_row_id(id);
         }
-        crate::update::apply_sorted(
-            Box::new(changes.reader()?),
-            &self.workspace,
+        let reader = input.reader()?;
+        let input_bytes = reader.get_ref().metadata()?.len();
+        crate::update::apply_ordered(
+            records(reader, Change::read),
+            &workspace,
             &updated,
+            input_bytes,
             source,
             sink,
             options,
@@ -112,15 +138,19 @@ impl Transaction {
             Change::Insert { row_id, record, .. } => Ok((row_id, record)),
             _ => Err(BeechError::Query("new tables require insert changes".into())),
         });
-        let level = crate::tree::build_leaves(sink, &self.schema, rows, options, &self.workspace)?;
+        let workspace = &self.scratch.as_ref().ok_or_else(failed)?.1;
+        let level = crate::tree::build_leaves(sink, &self.schema, rows, options, workspace)?;
         table.with_root(crate::tree::finish_tree(
             sink,
             &self.schema,
             level,
             options,
-            &self.workspace,
+            workspace,
         )?)
     }
+}
+fn failed() -> BeechError {
+    BeechError::Query("transaction has failed".into())
 }
 fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "invalid transaction record")
@@ -260,11 +290,11 @@ impl RefRecord {
 }
 
 // Transaction framing belongs to the writer's codec, not the disk crate.
-fn write_frame(writer: &mut dyn Write, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_frame(writer: &mut dyn Write, bytes: &[u8]) -> io::Result<()> {
     writer.write_all(&(bytes.len() as u64).to_le_bytes())?;
     writer.write_all(bytes)
 }
-fn read_frame(reader: &mut dyn BufRead) -> io::Result<Option<Vec<u8>>> {
+pub(crate) fn read_frame(reader: &mut dyn BufRead) -> io::Result<Option<Vec<u8>>> {
     if reader.fill_buf()?.is_empty() {
         return Ok(None);
     }
@@ -331,5 +361,80 @@ mod framing_tests {
             let error = read_frame(&mut Cursor::new(bytes)).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
         }
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+    use beech_core::{
+        storage::{FileStore, Repository},
+        DataType, Field,
+    };
+    struct NoWrites;
+    impl ObjectSink for NoWrites {
+        fn put(&mut self, _: Id, _: &[u8]) -> io::Result<()> {
+            panic!("failed transaction must not stage objects")
+        }
+    }
+    fn schema() -> TableSchema {
+        TableSchema::new(vec![Field::new("k", DataType::Int64, false)], vec![0]).unwrap()
+    }
+    fn insert(key: i64) -> Change {
+        Change::Insert {
+            key: vec![Scalar::Int64(key)],
+            row_id: key,
+            record: vec![Scalar::Int64(key)],
+        }
+    }
+    #[test]
+    fn failed_push_discards_scratch_and_rejects_further_use() {
+        for build in [false, true] {
+            let mut tx = Transaction::new(schema(), SortLimits::default()).unwrap();
+            let path = tx.scratch.as_ref().unwrap().1.path().to_path_buf();
+            tx.push(insert(1)).unwrap();
+            assert!(tx
+                .push(Change::Delete {
+                    key: vec![Scalar::Utf8("bad".into())]
+                })
+                .is_err());
+            assert!(!path.exists());
+            assert!(tx.push(insert(2)).is_err());
+            if build {
+                assert!(tx.build("t".into(), &mut NoWrites, BuildOptions::default()).is_err());
+            } else {
+                let source = Repository::new(FileStore::new(&path));
+                let table = Table::new("t", schema(), None, -1).unwrap();
+                assert!(tx.apply(&table, &source, &mut NoWrites, BuildOptions::default()).is_err());
+            }
+        }
+    }
+    #[test]
+    fn workspace_write_failure_aborts_before_staging_and_cleans_up() {
+        let mut tx = Transaction::new(schema(), SortLimits::default()).unwrap();
+        tx.push(insert(1)).unwrap();
+        let path = tx.scratch.as_ref().unwrap().1.path().to_path_buf();
+        // Force the first mutable node write to fail, without relying on permissions.
+        std::fs::create_dir(path.join("node-0")).unwrap();
+        let source = Repository::new(FileStore::new(&path));
+        let table = Table::new("t", schema(), None, -1).unwrap();
+        assert!(tx.apply(&table, &source, &mut NoWrites, BuildOptions::default()).is_err());
+        assert!(!path.exists());
+    }
+    #[test]
+    fn staging_failure_discards_the_working_directory() {
+        struct Fail;
+        impl ObjectSink for Fail {
+            fn put(&mut self, _: Id, _: &[u8]) -> io::Result<()> {
+                Err(io::Error::other("injected staging failure"))
+            }
+        }
+        let mut tx = Transaction::new(schema(), SortLimits::default()).unwrap();
+        tx.push(insert(1)).unwrap();
+        let path = tx.scratch.as_ref().unwrap().1.path().to_path_buf();
+        let source = Repository::new(FileStore::new(&path));
+        let table = Table::new("t", schema(), None, -1).unwrap();
+        assert!(tx.apply(&table, &source, &mut Fail, BuildOptions::default()).is_err());
+        assert!(!path.exists());
     }
 }

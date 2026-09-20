@@ -287,3 +287,30 @@ fn unsupported_directory_sync_prevents_publication() {
     assert_eq!(fs::read(&path).unwrap(), b"original");
     assert_eq!(fs::read_dir(workspace.path()).unwrap().count(), 1);
 }
+
+#[test]
+fn staging_cleans_up_partial_writes_and_never_replaces_files() {
+    let workspace = Workspace::new().unwrap();
+    assert!(
+        workspace
+            .stage_file("object", |file| {
+                file.write_all(b"partial")?;
+                Err(io::Error::other("injected write failure"))
+            })
+            .is_err()
+    );
+    assert_eq!(fs::read_dir(workspace.path()).unwrap().count(), 0);
+    workspace.stage_file("object", |file| file.write_all(b"complete")).unwrap();
+    assert_eq!(
+        workspace.stage_file("object", |file| file.write_all(b"replacement")).unwrap_err().kind(),
+        io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(fs::read(workspace.path().join("object")).unwrap(), b"complete");
+    assert_eq!(fs::read_dir(workspace.path()).unwrap().count(), 1);
+    for name in ["", ".", "..", "../escape", "/absolute", "nested/file"] {
+        assert_eq!(
+            workspace.stage_file(name, |_| panic!("invalid name must not write")).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+}

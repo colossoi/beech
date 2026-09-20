@@ -284,6 +284,7 @@ dependencies = [
  "beech-core",
  "beech-disk",
  "beech-shaper",
+ "serde_json",
 ]
 
 [[package]]

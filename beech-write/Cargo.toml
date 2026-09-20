@@ -11,3 +11,4 @@ arrow-array = "=59.3.0"
 beech-disk = { path = "../beech-disk" }
 
 [dev-dependencies]
+serde_json = "1.0"

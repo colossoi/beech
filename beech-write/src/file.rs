@@ -1,6 +1,6 @@
 use crate::{ObjectSink, Writer};
 use beech_core::Id;
-use beech_disk::{atomic_replace, atomic_write, sync_directory, Workspace};
+use beech_disk::{atomic_replace, sync_directory, Workspace};
 use std::{
     fs::{self, File},
     io::{self, Write},
@@ -41,7 +41,7 @@ impl ObjectSink for FileWriter {
         if object_file_exists(&staged)? || object_file_exists(&self.directory.join(id.to_string()))? {
             return Ok(());
         }
-        atomic_write(&staged, |file| file.write_all(bytes))?;
+        self.staging.stage_file(&id.to_string(), |file| file.write_all(bytes))?;
         self.objects += 1;
         Ok(())
     }
@@ -60,7 +60,8 @@ impl Writer for FileWriter {
         Ok(())
     }
     fn commit(self) -> io::Result<()> {
-        // The directory itself is the on-disk object journal; no growing ID set.
+        // Sync and install completed objects only at publication time.
+        // The directory is the object journal; no growing ID set.
         for entry in fs::read_dir(self.staging.path())? {
             let entry = entry?;
             let destination = self.directory.join(entry.file_name());

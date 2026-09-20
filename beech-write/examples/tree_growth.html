@@ -1,0 +1,72 @@
+<div id="beech-tree-growth">
+  <h2>One insertion per transaction</h2>
+  <div class="viz-controls">
+    <button type="button" class="btn" data-action="previous">Previous</button>
+    <button type="button" class="btn btn-primary" data-action="next">Insert next row</button>
+    <label class="form-label">Committed rows: <output data-value="step">0</output>
+      <input class="form-range" type="range" min="0" value="0" aria-label="Committed insertion">
+    </label>
+  </div>
+  <div data-value="summary" aria-live="polite"></div>
+  <div class="table-responsive">
+    <table class="table table-sm"><thead><tr><th>This transaction</th><th>Leaves</th><th>Branches</th></tr></thead>
+      <tbody><tr><td>Path visits</td><td data-value="leafVisits"></td><td data-value="branchVisits"></td></tr>
+      <tr><td>Temporary writes</td><td data-value="leafWrites"></td><td data-value="branchWrites"></td></tr>
+      <tr><td>Final objects staged</td><td data-value="leavesStaged"></td><td data-value="branchesStaged"></td></tr></tbody>
+    </table>
+  </div>
+  <div data-value="disk" class="text-small"></div>
+  <div data-value="tree" aria-label="Committed tree"></div>
+  <div class="text-small text-muted">Highlighted nodes: new content IDs in this snapshot. L = leaf; B = branch.</div>
+</div>
+<style>
+#beech-tree-growth .tree-node { margin: .4rem 0; padding-left: .65rem; border-left: 1px solid var(--border); }
+#beech-tree-growth .tree-children { display:flex; flex-wrap:wrap; gap:.3rem .6rem; align-items:flex-start; }
+#beech-tree-growth .node-label { display:inline-block; padding:.25rem .4rem; border-radius:.25rem; }
+#beech-tree-growth .fresh { background:color-mix(in srgb,var(--viz-series-1) 16%,transparent); }
+#beech-tree-growth [data-value="disk"] { margin:.7rem 0; }
+</style>
+<script>
+(() => {
+  const frames = __FRAMES__;
+  const root = document.getElementById('beech-tree-growth');
+  const slider = root.querySelector('input');
+  const prev = root.querySelector('[data-action="previous"]');
+  const next = root.querySelector('[data-action="next"]');
+  let index = 0;
+  slider.max = frames.length - 1;
+  function ids(node, result = new Set()) {
+    if (node) { result.add(node.id); node.children.forEach(child => ids(child, result)); }
+    return result;
+  }
+  function nodeView(node, old) {
+    const box = document.createElement('div'); box.className = 'tree-node';
+    const label = document.createElement('span'); label.className = 'node-label' + (old.has(node.id) ? '' : ' fresh');
+    label.textContent = node.height === 0 ? `L [${node.keys.join(', ')}]` : `B · ${node.rows} rows`;
+    label.setAttribute('data-tooltip', `${node.id.slice(0,12)} · height ${node.height} · ${old.has(node.id) ? 'reused' : 'new'}`);
+    box.append(label);
+    if (node.children.length) {
+      const children = document.createElement('div'); children.className = 'tree-children';
+      node.children.forEach(child => children.append(nodeView(child, old))); box.append(children);
+    }
+    return box;
+  }
+  function render() {
+    const frame = frames[index];
+    slider.value = index;
+    prev.disabled = index === 0; next.disabled = index === frames.length - 1;
+    const set = (key, value) => { root.querySelector(`[data-value="${key}"]`).textContent = value; };
+    set('step', frame.step);
+    set('summary', `${frame.leaves} leaves · ${frame.branches} branches · height ${frame.height ?? '—'}`);
+    for (const key of ['leafVisits','branchVisits','leafWrites','branchWrites','leavesStaged','branchesStaged']) set(key, frame[key] ?? '—');
+    set('disk', index ? `Scratch peak: ${frame.scratchPeak.toLocaleString()} B · Staged tree: ${frame.stagedBytes.toLocaleString()} B · Repository with history: ${frame.repositoryBytes.toLocaleString()} B` : 'No transaction yet');
+    const tree = root.querySelector('[data-value="tree"]'); tree.replaceChildren();
+    if (frame.tree) tree.append(nodeView(frame.tree, ids(frames[index-1]?.tree)));
+    else tree.textContent = 'Empty tree';
+  }
+  prev.addEventListener('click', () => { index--; render(); });
+  next.addEventListener('click', () => { index++; render(); });
+  slider.addEventListener('input', () => { index = Number(slider.value); render(); });
+  render();
+})();
+</script>

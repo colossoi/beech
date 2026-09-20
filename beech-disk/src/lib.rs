@@ -28,8 +28,36 @@ impl Workspace {
     pub fn close(self) -> io::Result<()> {
         Arc::try_unwrap(self.0).map_err(|_| io::Error::other("scratch workspace still in use"))?.close()
     }
+    /// Retain this directory after dropping the workspace and return its path.
+    /// Fails while other workspace owners still exist, like `close`.
+    pub fn keep(self) -> io::Result<std::path::PathBuf> {
+        Ok(Arc::try_unwrap(self.0).map_err(|_| io::Error::other("scratch workspace still in use"))?.keep())
+    }
     pub fn path(&self) -> &Path {
         self.0.path()
+    }
+    /// Stage a complete file under a single filename without replacing an
+    /// existing file. Neither file contents nor the scratch directory are synced.
+    /// To publish durably, use `install_file` and sync the destination directory
+    /// before publishing any pointer to it. Failure cleans up partial writes.
+    pub fn stage_file(
+        &self,
+        name: &str,
+        write: impl FnOnce(&mut File) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mut components = Path::new(name).components();
+        if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+            || components.next().is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "staged file requires a single filename",
+            ));
+        }
+        let mut file = self.file()?;
+        write(file.as_file_mut())?;
+        fs::hard_link(file.path(), self.path().join(name))?;
+        file.close()
     }
     pub fn file(&self) -> io::Result<NamedTempFile> {
         NamedTempFile::new_in(self.path())
@@ -48,17 +76,22 @@ pub fn atomic_write(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>
     sync_directory(parent)?;
     let mut file = NamedTempFile::new_in(parent)?;
     write(file.as_file_mut())?;
-    sync_for_publication(&file)?;
+    sync_for_publication(file.as_file(), file.path())?;
     fs::hard_link(file.path(), path)?;
     let cleanup = file.close();
     sync_directory(parent)?;
     cleanup
 }
 
-/// Install an already synced file without replacing an existing destination.
+/// Sync a staged file’s contents, then install it without replacing an existing destination.
 /// Both paths must be on the same filesystem; sync the destination directory
 /// after installing a batch and before publishing its pointer.
 pub fn install_file(staged: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    let file = File::open(staged)?;
+    #[cfg(not(unix))]
+    let file = fs::OpenOptions::new().read(true).write(true).open(staged)?;
+    sync_for_publication(&file, staged)?;
     fs::hard_link(staged, destination)
 }
 
@@ -71,7 +104,7 @@ pub fn atomic_replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
     sync_directory(parent)?;
     let mut file = NamedTempFile::new_in(parent)?;
     file.write_all(bytes)?;
-    sync_for_publication(&file)?;
+    sync_for_publication(file.as_file(), file.path())?;
     #[cfg(not(windows))]
     file.persist(path).map_err(|e| e.error)?;
     #[cfg(windows)]
@@ -79,18 +112,20 @@ pub fn atomic_replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
     sync_directory(parent)
 }
 
-fn sync_for_publication(file: &NamedTempFile) -> io::Result<()> {
+fn sync_for_publication(file: &File, path: &Path) -> io::Result<()> {
+    #[cfg(not(windows))]
+    let _ = path;
     #[cfg(windows)]
     {
         use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, SetFileAttributesW};
-        let path = windows_path(file.path())?;
+        let path = windows_path(path)?;
         // SAFETY: path is a live NUL-terminated buffer. Clear tempfile's temporary
         // attribute before syncing and publishing, as tempfile::persist does.
         if unsafe { SetFileAttributesW(path.as_ptr(), FILE_ATTRIBUTE_NORMAL) } == 0 {
             return Err(io::Error::last_os_error());
         }
     }
-    file.as_file().sync_all()
+    file.sync_all()
 }
 
 #[cfg(windows)]

@@ -176,3 +176,82 @@ fn reuse_does_not_require_reading_existing_object_contents() {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     assert_eq!(fs::read(path).unwrap(), object.bytes().as_ref());
 }
+
+#[test]
+fn ordered_updates_publish_only_at_commit_and_abort_on_staging_failure() {
+    use std::io;
+    struct FailAfterOne<'a>(&'a mut FileWriter, usize);
+    impl ObjectSink for FailAfterOne<'_> {
+        fn put(&mut self, id: Id, bytes: &[u8]) -> io::Result<()> {
+            if self.1 == 1 {
+                return Err(io::Error::other("injected staging failure"));
+            }
+            self.1 += 1;
+            self.0.put(id, bytes)
+        }
+    }
+    let dir = beech_disk::Workspace::new().unwrap();
+    let first = publish(dir.path());
+    let repository = Arc::new(Repository::new(FileStore::new(dir.path())));
+    for fail in [true, false] {
+        let mut writer = FileWriter::new(dir.path()).unwrap();
+        // Snapshot selection happens under the writer lock.
+        let old = repository.snapshot(first.root_id).unwrap();
+        let table = old.table("t").unwrap();
+        let mut tx = Transaction::new(schema(), SortLimits::default()).unwrap();
+        for key in 3..12 {
+            tx.push(Change::Insert {
+                key: vec![Scalar::Int64(key)],
+                row_id: key,
+                record: vec![Scalar::Int64(key)],
+            })
+            .unwrap();
+        }
+        if fail {
+            assert!(tx
+                .apply(
+                    &table,
+                    &old,
+                    &mut FailAfterOne(&mut writer, 0),
+                    BuildOptions::new(1, 1).unwrap()
+                )
+                .is_err());
+            assert!(writer.num_to_commit() > 0);
+            writer.abort().unwrap();
+            assert_eq!(
+                fs::read_to_string(dir.path().join("root")).unwrap(),
+                first.root_id.to_string()
+            );
+            assert!(!fs::read_dir(dir.path()).unwrap().any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".beech-stage-")));
+        } else {
+            let updated = tx.apply(&table, &old, &mut writer, BuildOptions::new(1, 1).unwrap()).unwrap();
+            let next = publish_table(
+                &mut writer,
+                &updated,
+                old.transaction().tables().clone(),
+                Some(first.transaction_id),
+            )
+            .unwrap();
+            assert_eq!(
+                fs::read_to_string(dir.path().join("root")).unwrap(),
+                first.root_id.to_string()
+            );
+            writer.commit().unwrap();
+            assert_eq!(
+                fs::read_to_string(dir.path().join("root")).unwrap(),
+                next.root_id.to_string()
+            );
+            let new = repository.snapshot(next.root_id).unwrap();
+            let new_table = new.table("t").unwrap();
+            assert_eq!(RowCursor::new(&new, &new_table, vec![]).unwrap().count(), 11);
+        }
+        assert_eq!(
+            RowCursor::new(&old, &table, vec![]).unwrap().collect::<beech_core::Result<Vec<_>>>().unwrap(),
+            rows()
+        );
+    }
+}

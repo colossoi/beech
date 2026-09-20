@@ -5,9 +5,12 @@ Filesystem tools independent of Beech's table and object formats:
 - `Workspace` owns temporary directories and keeps them alive while scratch files
   or sorted-run readers exist. Normal drop and error unwinding clean up scratch data;
   `close` reports explicit cleanup failures.
+- `Workspace::stage_file` installs a complete scratch filename without syncing
+  either contents or directory. At publication, `install_file` syncs its contents
+  and installs it; sync the destination directory before publishing its root pointer.
 - `atomic_write` writes and syncs a temporary file, then installs the destination
   with a hard link. An existing destination produces `AlreadyExists` and is
-  never overwritten. `install_file` links an already synced staged file.
+  never overwritten. `install_file` syncs and links a staged file.
 - `atomic_replace` syncs a temporary file and atomically replaces a mutable
   pointer. Use this only after its referenced immutable files are installed.
 - `read_at` supplies portable positional reads on Unix and Windows. It was

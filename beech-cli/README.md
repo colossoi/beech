@@ -21,9 +21,11 @@ significant. For headerless CSV, pass `--has-headers false`; column names become
 `col_0`, `col_1`, etc. Empty input is rejected. All rows must have the same width.
 
 CSV input is copied to a temporary file. Inference and parsing stream that disk
-snapshot; mutations are spooled and externally sorted with an 8 MiB chunk budget
-and merge fan-in of 32. Large individual records and codec/cache buffers add to
-that budget. Objects are published only when the transaction completes.
+snapshot. Replace mode externally sorts spooled rows with an 8 MiB chunk budget
+and merge fan-in of 32. Insert mode processes spooled mutations in input order
+against a private disk-backed working tree. Large individual records and
+codec/cache buffers add to memory use. Only final tree objects are staged, and
+the new snapshot becomes visible when the transaction commits.
 
 Replace mode infers types across each entire column: Int64, UInt64, Boolean,
 Float64, or Utf8. Mixed numeric/text columns remain text. Large integer values

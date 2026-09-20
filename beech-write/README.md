@@ -7,7 +7,8 @@ The writer has three separate operations:
   nodes through `ObjectSink`, returning a `Table`. Empty tables are supported.
 - `apply_changes(changes, table, source, sink, options)` applies insert,
   update, and delete operations and returns the updated `Table`, including its
-  row-ID high-water mark. Changes are externally sorted; repeated keys are rejected.
+  row-ID high-water mark. Changes run in submission order; repeated keys see
+  earlier edits in the same transaction.
   Keys must match their rows; missing
   update/delete keys and duplicate inserts are errors. Empty changes reuse the
   current root without writing anything.
@@ -23,35 +24,37 @@ boundaries using canonical logical bytes; its hash is never an object ID.
 `BuildOptions` measures logical bytes, not compressed file size. New branch
 splits have at least two children so even very small targets terminate.
 
-`Transaction::push` validates and spools incoming mutations to disk. Its `build`
-and `apply` methods externally sort them using `beech-disk`; `build_table` and
-`apply_changes` are iterator conveniences over this same transaction path.
-The final heap merge streams directly into validation and tree processing;
-validation reopens the runs rather than materializing another sorted file.
-`SortLimits` controls chunk memory and merge fan-in (8 MiB and 32 by default).
+`Transaction::push` validates and spools incoming mutations to disk. A failed
+push discards its workspace and permanently rejects further use. `build` sorts
+rows using `beech-disk`, rejects duplicate keys, and streams the result into the
+bulk builder. `SortLimits` applies only to bulk creation (8 MiB and 32 merge
+inputs by default).
 
-Updates read one sorted change ahead, visit affected paths, and spool merged rows
-and replacement node references. Large appends do not accumulate a whole merged
-leaf or a whole tree level in RAM. Encoding holds one output leaf; branch building
-holds two child groups to absorb a final singleton. Probabilistic splitting has a
-hard cutoff at four times the logical target, plus one record (branches still need
-at least two children). No-op updates preserve the original root and stage no
-objects, though they use temporary scratch files.
+`apply` processes the input spool in submission order. Each mutation finds its
+leaf in a private working tree, reads that leaf, applies the change, and reshapes
+it using `ProbShaper`. Modified ancestors are reshaped too. Unchanged nodes retain
+immutable references; modified nodes use private temporary IDs and buffered files
+in a `beech-disk::Workspace`. Repeated edits reuse those files. There is no growing
+in-memory dirty-node map, and no public API for reading unfinished edits.
 
-Memory includes sort chunks or merge heads, one decoded input leaf/batch, output
-encoding buffers, active ancestor references, and the repository cache. The sort
-budget is not a process-wide memory limit; individual large rows/keys and existing
-large leaves still matter. Scratch spools provide bounded transaction processing,
-not crash recovery or resumable transactions.
+The shared shaper has a cutoff at four times the logical target plus one record;
+branches require two children before splitting. Empty nodes are removed and
+one-child roots collapse. Identical updates do not rewrite or reshape anything.
+After every operation succeeds, finalization encodes only reachable working
+nodes, bottom-up, into Parquet leaves and Thrift branches. Intermediate versions
+never reach the object sink. Root publication still happens only at writer commit.
+On any processing or staging error, discard the transaction and abort the writer;
+there is no per-operation rollback. Scratch writes are flushed before reuse but
+not synced; this workspace is not a recovery log.
 
-The default repository budgets are 16 MiB of metadata and 128 MiB of column
-cache, in addition to the default 8 MiB sort chunk or up to 32 merge heads.
-Active readers can retain evicted cache entries. The update traversal retains
-one decoded branch per ancestor; output references go to spools. Sort-run
-bookkeeping grows logarithmically with input size. Snapshot publication also
-holds the table-name/ID map in memory, proportional to the number of tables.
-These are accounting budgets, not a hard RSS ceiling: encoding can hold rows,
-Arrow arrays, and Parquet bytes simultaneously.
+Updates retain the current leaf, one branch per active ancestor, shaping groups,
+encoding buffers, and the repository caches. Large individual rows or existing
+nodes can still be expensive. The default repository budgets are 16 MiB metadata
+and 128 MiB columns; active readers may retain evicted entries. Final encoding
+can hold rows, Arrow arrays, and Parquet bytes simultaneously. Bulk sorting has
+its own chunk/merge budgets and logarithmic run bookkeeping. Snapshot publication
+also holds a table-name/ID map proportional to the number of tables. These are
+working-set bounds, not a hard process-memory limit.
 
 Splitting is local; there is no boundary realignment or sibling rebalancing.
 Deletions can leave underfull branches. The resulting tree is valid but its shape
@@ -67,8 +70,9 @@ writers. Readers do not acquire a lock. The lock releases on drop, including
 process exit; the `.beech-write.lock` file remains in the directory.
 
 Objects are staged in a private temporary directory on the same filesystem.
-Staging syncs each object. Commit walks the staging directory (no in-memory ID
-set), links files into place without overwriting existing objects,
+Staging writes and closes objects without any file or directory syncs. Commit
+walks the staging directory (no in-memory ID set), syncs each completed object’s
+contents, links files into place without overwriting existing objects,
 and atomically replaces the text `root` pointer last. Existing objects are reused
 by ID using metadata checks, without reading or comparing their contents. The
 writer trusts codec-produced IDs; integrity verification belongs to the reader
@@ -86,3 +90,44 @@ protocol.
 
 Run `cargo test -p beech-write -p beech-test-fixtures --locked` for writer,
 publication, merge, and cursor integration tests.
+
+## Transaction statistics and demo
+
+`Transaction::apply_with_stats` returns `(Table, TransactionStats)`. It records
+operation/no-op counts, leaf and branch visits, temporary rewrites, local splits,
+root collapses, final staged objects/bytes, elapsed apply time, and peak scratch
+file bytes. Visits include repeated visits and no-ops; they are not distinct-node
+counts or physical disk reads. Finalization reads are excluded from visits.
+Scratch peak includes the input spool and temporary nodes, but not publication
+staging, filesystem allocation overhead, or the existing repository. Staged
+bytes count bytes passed to the sink before possible deduplication. Statistics
+currently cover ordered updates, not the bulk builder or snapshot publication.
+
+Run `cargo run -p beech-write --example tree_growth -- 48 target/tree-growth-demo.json`.
+The demo starts empty and commits one insertion at a time, reopening and checking
+every snapshot. Small 128-byte logical targets make splits visible. It prints
+costs per insertion and saves JSON plus an interactive HTML fragment for replay.
+The temporary repository is removed after the demo; replay data retains all
+measured snapshots. Pass `--keep-workspace` to retain the database directory
+(including on failure); the demo prints its path. Per-transaction scratch files
+are still cleaned up normally. To save just the final state, use
+`--export-final /path/to/new-directory`. The destination must not exist. The demo
+copies reachable leaves and branches unchanged, then publishes fresh snapshot
+metadata without predecessor history. The result is a standalone Beech repository.
+
+Each row is a separate durable commit. Repository bytes in the demo include
+historical objects.
+
+For a larger transaction, run:
+
+```sh
+cargo run -p beech-write --release --example random_edits
+```
+
+This builds and commits 5,000 rows, then submits 1,000 seeded random inserts,
+updates, and deletes in one transaction. It uses the default 1,000-byte logical
+node target (the growth replay uses 128 bytes to expose splits). It verifies
+all final rows against an in-memory reference model and checks that the old
+snapshot remains readable. The printed update timings exclude initial creation
+and final verification; total update time includes workload generation and
+spooling. The temporary database is removed on exit.

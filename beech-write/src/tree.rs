@@ -31,11 +31,6 @@ fn save_node(writer: &mut impl ObjectSink, node: EncodedNode) -> Result<NodeRef>
     Ok(node.reference().clone())
 }
 pub(crate) type Nodes = Spool;
-pub(crate) fn singleton(workspace: &Workspace, reference: &NodeRef) -> Result<Nodes> {
-    let mut nodes = Nodes::new(workspace)?;
-    nodes.append(|writer| RefRecord::new(reference).write(writer))?;
-    Ok(nodes)
-}
 pub(crate) fn build_leaves(
     writer: &mut impl ObjectSink,
     schema: &TableSchema,
@@ -44,33 +39,20 @@ pub(crate) fn build_leaves(
     workspace: &Workspace,
 ) -> Result<Nodes> {
     let mut level = Nodes::new(workspace)?;
-    let mut shaper = ProbShaper::new(options.target_bytes, options.stddev_bytes);
-    let mut batch = vec![];
-    let mut size = 0usize;
-    for row in rows {
-        let row = row?;
-        let bytes = codec::thrift::encode_row_for_splitting(&row)?;
-        size = size.saturating_add(bytes.len());
-        let split = shaper.is_complete(&bytes) || size >= options.target_bytes.saturating_mul(4);
-        batch.push(row);
-        if split {
+    shape(
+        rows,
+        options,
+        1,
+        codec::thrift::encode_row_for_splitting,
+        |batch| {
             let reference = RefRecord::new(&save_node(
                 writer,
                 codec::parquet::encode_leaf(schema, &batch_from_rows(schema, &batch)?)?,
             )?);
             level.append(|out| reference.write(out))?;
-            batch.clear();
-            size = 0;
-            shaper = ProbShaper::new(options.target_bytes, options.stddev_bytes);
-        }
-    }
-    if !batch.is_empty() {
-        let reference = RefRecord::new(&save_node(
-            writer,
-            codec::parquet::encode_leaf(schema, &batch_from_rows(schema, &batch)?)?,
-        )?);
-        level.append(|out| reference.write(out))?;
-    }
+            Ok(())
+        },
+    )?;
     Ok(level)
 }
 pub(crate) fn finish_tree(
@@ -93,39 +75,61 @@ pub(crate) fn build_parents(
     workspace: &Workspace,
 ) -> Result<Nodes> {
     let mut output = Nodes::new(workspace)?;
-    let mut pending = vec![];
+    let children = records(level.reader()?, RefRecord::read).map(|r| r?.node(schema));
+    shape(
+        children,
+        options,
+        2,
+        |child| codec::thrift::encode_key(child.max_key()),
+        |children| {
+            let height = children[0]
+                .height()
+                .checked_add(1)
+                .ok_or_else(|| BeechError::InvalidNode("tree height overflow".into()))?;
+            let node = save_node(
+                writer,
+                codec::thrift::encode_internal(&InternalNode::new(schema, height, children)?, schema)?,
+            )?;
+            output.append(|writer| RefRecord::new(&node).write(writer))?;
+            Ok(())
+        },
+    )?;
+    Ok(output)
+}
+
+// Hold one complete group to absorb a final undersized group. The two-child
+// minimum for branches guarantees progress even with a one-byte target.
+pub(crate) fn shape<T>(
+    items: impl IntoIterator<Item = Result<T>>,
+    options: BuildOptions,
+    minimum: usize,
+    bytes: impl Fn(&T) -> Result<Vec<u8>>,
+    mut emit: impl FnMut(Vec<T>) -> Result<()>,
+) -> Result<()> {
     let mut group = vec![];
+    let mut pending = vec![];
     let mut size = 0usize;
     let mut shaper = ProbShaper::new(options.target_bytes, options.stddev_bytes);
-    let mut emit = |children: Vec<NodeRef>| -> Result<()> {
-        let height = children[0]
-            .height()
-            .checked_add(1)
-            .ok_or_else(|| BeechError::InvalidNode("tree height overflow".into()))?;
-        let node = save_node(
-            writer,
-            codec::thrift::encode_internal(&InternalNode::new(schema, height, children)?, schema)?,
-        )?;
-        output.append(|writer| RefRecord::new(&node).write(writer))?;
-        Ok(())
-    };
-    for child in records(level.reader()?, RefRecord::read) {
-        let child = child?.node(schema)?;
-        let bytes = codec::thrift::encode_key(child.max_key())?;
+    for item in items {
+        let item = item?;
+        let bytes = bytes(&item)?;
         size = size.saturating_add(bytes.len());
         let split = shaper.is_complete(&bytes) || size >= options.target_bytes.saturating_mul(4);
-        group.push(child);
-        if split && group.len() >= 2 {
-            if !pending.is_empty() {
-                emit(std::mem::take(&mut pending))?;
+        group.push(item);
+        if split && group.len() >= minimum {
+            if minimum == 1 {
+                emit(std::mem::take(&mut group))?;
+            } else {
+                if !pending.is_empty() {
+                    emit(std::mem::take(&mut pending))?;
+                }
+                pending = std::mem::take(&mut group);
             }
-            pending = std::mem::take(&mut group);
             size = 0;
             shaper = ProbShaper::new(options.target_bytes, options.stddev_bytes);
         }
     }
-    // Hold one completed group so a final singleton can join it.
-    if group.len() == 1 {
+    if group.len() < minimum {
         pending.extend(group);
     } else if !group.is_empty() {
         if !pending.is_empty() {
@@ -136,5 +140,5 @@ pub(crate) fn build_parents(
     if !pending.is_empty() {
         emit(pending)?;
     }
-    Ok(output)
+    Ok(())
 }
