@@ -8,4 +8,6 @@ beech-core = { path = "../beech-core" }
 beech-shaper = { path = "../beech-shaper" }
 arrow-array = "=59.3.0"
 
-tempfile = "3"
+beech-disk = { path = "../beech-disk" }
+
+[dev-dependencies]

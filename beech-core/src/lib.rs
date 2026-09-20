@@ -230,6 +230,7 @@ pub struct Table {
     name: String,
     schema: TableSchema,
     root: Option<NodeRef>,
+    max_row_id: i64,
 }
 impl Table {
     pub fn name(&self) -> &str {
@@ -241,11 +242,33 @@ impl Table {
     pub fn root(&self) -> Option<&NodeRef> {
         self.root.as_ref()
     }
-    pub fn new(name: impl Into<String>, schema: TableSchema, root: Option<NodeRef>) -> Result<Self> {
+    /// Highest assigned row ID, including deleted rows; -1 for a new empty table.
+    pub fn max_row_id(&self) -> i64 {
+        self.max_row_id
+    }
+    /// Advance the high-water mark without allowing it to decrease.
+    pub fn with_max_row_id(mut self, id: i64) -> Self {
+        self.max_row_id = self.max_row_id.max(id);
+        self
+    }
+    /// Replace the tree while preserving table metadata, including row-ID allocation.
+    pub fn with_root(&self, root: Option<NodeRef>) -> Result<Self> {
+        let mut table = self.clone();
+        table.root = root;
+        table.validate()?;
+        Ok(table)
+    }
+    pub fn new(
+        name: impl Into<String>,
+        schema: TableSchema,
+        root: Option<NodeRef>,
+        max_row_id: i64,
+    ) -> Result<Self> {
         let table = Self {
             name: name.into(),
             schema,
             root,
+            max_row_id,
         };
         table.validate()?;
         Ok(table)

@@ -45,7 +45,7 @@ fn sqlite(dir: &Path, table: &str) -> rusqlite::Connection {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     beech_sqlite3::create_beech_module(&conn).unwrap();
     conn.execute_batch(&format!(
-        "CREATE VIRTUAL TABLE data USING beech('{}', 'unused', '{}')",
+        "CREATE VIRTUAL TABLE data USING beech('{}', '{}')",
         dir.display().to_string().replace('\'', "''"),
         table
     ))
@@ -54,7 +54,7 @@ fn sqlite(dir: &Path, table: &str) -> rusqlite::Connection {
 }
 #[test]
 fn csv_replace_insert_info_inspect_and_sqlite_round_trip() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = beech_disk::Workspace::new().unwrap();
     let path = dir.path();
     load_ok(path, "items", "id,name\n3,three\n1,one\n", "replace");
     let original_root = fs::read(path.join("root")).unwrap();
@@ -90,7 +90,7 @@ fn csv_replace_insert_info_inspect_and_sqlite_round_trip() {
 }
 #[test]
 fn failed_insert_leaves_root_and_rows_unchanged() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = beech_disk::Workspace::new().unwrap();
     let path = dir.path();
     load_ok(path, "items", "id,name\n1,one\n", "replace");
     let root = fs::read(path.join("root")).unwrap();
@@ -113,7 +113,7 @@ fn failed_insert_leaves_root_and_rows_unchanged() {
 }
 #[test]
 fn replacing_one_table_preserves_others_and_inspects_their_schema() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = beech_disk::Workspace::new().unwrap();
     let path = dir.path();
     load_ok(path, "a", "id,value\n1,alpha\n", "replace");
     load_ok(path, "z", "name,active\nz,true\n", "replace");
@@ -132,7 +132,7 @@ fn replacing_one_table_preserves_others_and_inspects_their_schema() {
 }
 #[test]
 fn csv_inference_uses_whole_column_and_supports_headerless_keys() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = beech_disk::Workspace::new().unwrap();
     let path = dir.path();
     load_ok(path, "mixed", "id,value\n1,123\n2,text\n", "replace");
     assert_eq!(
@@ -163,7 +163,7 @@ fn csv_inference_uses_whole_column_and_supports_headerless_keys() {
 }
 #[test]
 fn invalid_build_options_fail_without_publication() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = beech_disk::Workspace::new().unwrap();
     let input = dir.path().join("input.csv");
     fs::write(&input, "id\n1\n").unwrap();
     let out = cli(&[
@@ -180,7 +180,7 @@ fn invalid_build_options_fail_without_publication() {
 
 #[test]
 fn csv_large_integers_do_not_lose_precision() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = beech_disk::Workspace::new().unwrap();
     let path = dir.path();
     load_ok(path, "unsigned", "id,value\n1,18446744073709551615\n", "replace");
     assert_eq!(
@@ -207,4 +207,59 @@ fn csv_large_integers_do_not_lose_precision() {
         sqlite(path, "huge").query_row("SELECT value FROM data", [], |r| r.get::<_, String>(0)).unwrap(),
         "999999999999999999999999999999999999999999999"
     );
+}
+
+#[test]
+fn insert_uses_persisted_high_water_mark_after_all_rows_are_deleted() {
+    use beech_core::{
+        codec,
+        storage::{FileStore, Repository},
+        Id, Scalar,
+    };
+    use beech_write::{apply_changes, publish_table, BuildOptions, Change, FileWriter, Writer};
+    use std::sync::Arc;
+    let dir = beech_disk::Workspace::new().unwrap();
+    let path = dir.path();
+    load_ok(path, "items", "id,name\n1,one\n2,two\n", "replace");
+    let repository = Arc::new(Repository::new(FileStore::new(path)));
+    let root = Id::from_hex(fs::read_to_string(path.join("root")).unwrap().trim()).unwrap();
+    let snapshot = repository.snapshot(root).unwrap();
+    let table = snapshot.table("items").unwrap();
+    assert_eq!(table.max_row_id(), 1);
+    let mut writer = FileWriter::new(path).unwrap();
+    let empty = apply_changes(
+        [1, 2].map(|id| Change::Delete {
+            key: vec![Scalar::Int64(id)],
+        }),
+        &table,
+        &snapshot,
+        &mut writer,
+        BuildOptions::default(),
+    )
+    .unwrap();
+    assert!(empty.root().is_none());
+    assert_eq!(empty.max_row_id(), 1);
+    publish_table(
+        &mut writer,
+        &empty,
+        snapshot.transaction().tables().clone(),
+        Some(codec::thrift::encode_transaction(snapshot.transaction()).unwrap().id()),
+    )
+    .unwrap();
+    writer.commit().unwrap();
+    load_ok(path, "items", "id,name\n3,three\n", "insert");
+    assert_eq!(info(path)["tables"][0]["max_row_id"], 2);
+    let rowid: i64 = sqlite(path, "items").query_row("SELECT rowid FROM data", [], |r| r.get(0)).unwrap();
+    assert_eq!(rowid, 2);
+
+    // Exhausted allocation must fail without changing the published snapshot.
+    let mut writer = FileWriter::new(path).unwrap();
+    let exhausted = empty.with_max_row_id(i64::MAX);
+    publish_table(&mut writer, &exhausted, Default::default(), None).unwrap();
+    writer.commit().unwrap();
+    let before = fs::read(path.join("root")).unwrap();
+    let result = load(path, "items", "id,name\n4,four\n", "insert");
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("row ID overflow"));
+    assert_eq!(fs::read(path.join("root")).unwrap(), before);
 }

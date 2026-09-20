@@ -46,7 +46,12 @@ fn build(s: &TableSchema, rows: &[Row], leaf_rows: usize) -> Result<Tree> {
             .collect::<Result<_>>()?;
     }
     Ok(Tree {
-        table: Table::new("bench", s.clone(), level.pop())?,
+        table: Table::new(
+            "bench",
+            s.clone(),
+            level.pop(),
+            rows.iter().map(|r| r.0).max().unwrap_or(-1),
+        )?,
         store,
         objects,
     })

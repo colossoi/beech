@@ -46,7 +46,12 @@ fn typed_encoders_support_store_reopen_plan_and_projection() -> Result<()> {
     assert_eq!(node.seek(&schema, &vec![Scalar::Int64(2)])?, Some(1));
     let encoded = codec::thrift::encode_internal(&node, &schema)?;
     store.put(encoded.reference().id(), encoded.bytes().clone())?;
-    let table = Table::new("items", schema, Some(encoded.reference().clone()))?;
+    let table = Table::new(
+        "items",
+        schema,
+        Some(encoded.reference().clone()),
+        rows.iter().map(|r| r.0).max().unwrap(),
+    )?;
     let object = codec::thrift::encode_table(&table)?;
     let table_id = object.id();
     store.put(object.id(), object.bytes().clone())?;
@@ -129,7 +134,7 @@ fn custom_node_source_can_open_and_scan_projected_leaves() -> Result<()> {
         *reference
     );
     assert!(NodeRef::new(&schema, reference.id(), 0, 0, reference.max_key().clone()).is_err());
-    let table = Arc::new(Table::new("custom", schema, Some(reference.clone()))?);
+    let table = Arc::new(Table::new("custom", schema, Some(reference.clone()), 7)?);
     let store = MemoryStore::default();
     store.put(reference.id(), node.bytes().clone())?;
     let source = SingleLeafSource {

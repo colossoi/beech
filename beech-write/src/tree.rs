@@ -1,101 +1,140 @@
-use crate::{batch_from_rows, BuildOptions, ObjectSink};
+use crate::transaction::records;
+use crate::{batch_from_rows, transaction::RefRecord, BuildOptions, Change, ObjectSink, Transaction};
 use beech_core::{
     codec::{self, EncodedNode},
-    BeechError, InternalNode, KeyOrdering, NodeRef, Result, Row, Table, TableSchema,
+    BeechError, InternalNode, NodeRef, Result, Row, Table, TableSchema,
 };
+use beech_disk::{SortLimits, Spool, Workspace};
 use beech_shaper::ProbShaper;
-use std::cmp::Ordering;
 
-/// Validate and sort logical rows, then stage the tree objects. Does not publish a snapshot.
+/// Spool and externally sort incoming rows, then stream the tree into the sink.
 pub fn build_table<W: ObjectSink>(
     writer: &mut W,
     name: String,
     schema: TableSchema,
-    rows: Vec<Row>,
+    rows: impl IntoIterator<Item = Row>,
     options: BuildOptions,
 ) -> Result<Table> {
-    // Validate the name before staging any data.
-    Table::new(name.clone(), schema.clone(), None)?;
-    let rows = sorted_rows(&schema, rows)?;
-    let root = build_tree(writer, &schema, rows, options)?;
-    Table::new(name, schema, root)
-}
-
-fn sorted_rows(schema: &TableSchema, rows: Vec<Row>) -> Result<Vec<Row>> {
-    let mut keyed =
-        rows.into_iter().map(|row| Ok((schema.key_from_row(&row)?, row))).collect::<Result<Vec<_>>>()?;
-    // Every key has already been validated against exactly the same schema.
-    keyed.sort_by(|a, b| a.0.compare_key(&b.0).expect("schema-validated keys"));
-    for pair in keyed.windows(2) {
-        if pair[0].0.compare_key(&pair[1].0)? == Ordering::Equal {
-            return Err(BeechError::Query(format!("duplicate key: {:?}", pair[0].0)));
-        }
+    Table::new(name.clone(), schema.clone(), None, -1)?;
+    let mut transaction = Transaction::new(schema.clone(), SortLimits::default())?;
+    for row in rows {
+        transaction.push(Change::Insert {
+            key: schema.key_from_row(&row)?,
+            row_id: row.0,
+            record: row.1,
+        })?;
     }
-    Ok(keyed.into_iter().map(|(_, row)| row).collect())
+    transaction.build(name, writer, options)
 }
-
-fn save_node<W: ObjectSink>(writer: &mut W, node: EncodedNode) -> Result<NodeRef> {
+fn save_node(writer: &mut impl ObjectSink, node: EncodedNode) -> Result<NodeRef> {
     writer.put(node.reference().id(), node.bytes())?;
     Ok(node.reference().clone())
 }
-pub(crate) fn build_tree<W: ObjectSink>(
-    writer: &mut W,
+pub(crate) type Nodes = Spool;
+pub(crate) fn singleton(workspace: &Workspace, reference: &NodeRef) -> Result<Nodes> {
+    let mut nodes = Nodes::new(workspace)?;
+    nodes.append(|writer| RefRecord::new(reference).write(writer))?;
+    Ok(nodes)
+}
+pub(crate) fn build_leaves(
+    writer: &mut impl ObjectSink,
     schema: &TableSchema,
-    rows: Vec<Row>,
+    rows: impl IntoIterator<Item = Result<Row>>,
     options: BuildOptions,
-) -> Result<Option<NodeRef>> {
-    let mut level = vec![];
+    workspace: &Workspace,
+) -> Result<Nodes> {
+    let mut level = Nodes::new(workspace)?;
     let mut shaper = ProbShaper::new(options.target_bytes, options.stddev_bytes);
     let mut batch = vec![];
+    let mut size = 0usize;
     for row in rows {
-        let split = shaper.is_complete(&codec::thrift::encode_row_for_splitting(&row)?);
+        let row = row?;
+        let bytes = codec::thrift::encode_row_for_splitting(&row)?;
+        size = size.saturating_add(bytes.len());
+        let split = shaper.is_complete(&bytes) || size >= options.target_bytes.saturating_mul(4);
         batch.push(row);
         if split {
-            level.push(save_node(
+            let reference = RefRecord::new(&save_node(
                 writer,
                 codec::parquet::encode_leaf(schema, &batch_from_rows(schema, &batch)?)?,
             )?);
+            level.append(|out| reference.write(out))?;
             batch.clear();
+            size = 0;
             shaper = ProbShaper::new(options.target_bytes, options.stddev_bytes);
         }
     }
     if !batch.is_empty() {
-        level.push(save_node(
+        let reference = RefRecord::new(&save_node(
             writer,
             codec::parquet::encode_leaf(schema, &batch_from_rows(schema, &batch)?)?,
         )?);
+        level.append(|out| reference.write(out))?;
     }
+    Ok(level)
+}
+pub(crate) fn finish_tree(
+    writer: &mut impl ObjectSink,
+    schema: &TableSchema,
+    mut level: Nodes,
+    options: BuildOptions,
+    workspace: &Workspace,
+) -> Result<Option<NodeRef>> {
     while level.len() > 1 {
-        let mut groups = vec![];
-        let mut children = vec![];
-        let mut shaper = ProbShaper::new(options.target_bytes, options.stddev_bytes);
-        for child in level {
-            let split = shaper.is_complete(&codec::thrift::encode_key(child.max_key())?);
-            children.push(child);
-            // Every parent must reduce the number of nodes, even with tiny targets.
-            if split && children.len() >= 2 {
-                groups.push(std::mem::take(&mut children));
-                shaper = ProbShaper::new(options.target_bytes, options.stddev_bytes);
-            }
-        }
-        if children.len() == 1 && !groups.is_empty() {
-            groups.last_mut().unwrap().extend(children);
-        } else if !children.is_empty() {
-            groups.push(children);
-        }
-        level = groups
-            .into_iter()
-            .map(|children| {
-                let height = children[0]
-                    .height()
-                    .checked_add(1)
-                    .ok_or_else(|| BeechError::InvalidNode("tree height overflow".into()))?;
-                save_node(
-                    writer,
-                    codec::thrift::encode_internal(&InternalNode::new(schema, height, children)?, schema)?,
-                )
-            })
-            .collect::<Result<_>>()?;
+        level = build_parents(writer, schema, level, options, workspace)?;
     }
-    Ok(level.pop())
+    records(level.reader()?, RefRecord::read).next().map(|r| r?.node(schema)).transpose()
+}
+pub(crate) fn build_parents(
+    writer: &mut impl ObjectSink,
+    schema: &TableSchema,
+    mut level: Nodes,
+    options: BuildOptions,
+    workspace: &Workspace,
+) -> Result<Nodes> {
+    let mut output = Nodes::new(workspace)?;
+    let mut pending = vec![];
+    let mut group = vec![];
+    let mut size = 0usize;
+    let mut shaper = ProbShaper::new(options.target_bytes, options.stddev_bytes);
+    let mut emit = |children: Vec<NodeRef>| -> Result<()> {
+        let height = children[0]
+            .height()
+            .checked_add(1)
+            .ok_or_else(|| BeechError::InvalidNode("tree height overflow".into()))?;
+        let node = save_node(
+            writer,
+            codec::thrift::encode_internal(&InternalNode::new(schema, height, children)?, schema)?,
+        )?;
+        output.append(|writer| RefRecord::new(&node).write(writer))?;
+        Ok(())
+    };
+    for child in records(level.reader()?, RefRecord::read) {
+        let child = child?.node(schema)?;
+        let bytes = codec::thrift::encode_key(child.max_key())?;
+        size = size.saturating_add(bytes.len());
+        let split = shaper.is_complete(&bytes) || size >= options.target_bytes.saturating_mul(4);
+        group.push(child);
+        if split && group.len() >= 2 {
+            if !pending.is_empty() {
+                emit(std::mem::take(&mut pending))?;
+            }
+            pending = std::mem::take(&mut group);
+            size = 0;
+            shaper = ProbShaper::new(options.target_bytes, options.stddev_bytes);
+        }
+    }
+    // Hold one completed group so a final singleton can join it.
+    if group.len() == 1 {
+        pending.extend(group);
+    } else if !group.is_empty() {
+        if !pending.is_empty() {
+            emit(std::mem::take(&mut pending))?;
+        }
+        pending = group;
+    }
+    if !pending.is_empty() {
+        emit(pending)?;
+    }
+    Ok(output)
 }

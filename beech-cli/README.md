@@ -12,12 +12,18 @@ cargo run -p beech-sqlite3-test -- /tmp/beech-data items
 `load-csv` defaults to replace mode. It replaces the named table and preserves
 all other tables and the previous transaction link. `--mode insert` requires an
 existing table, parses CSV against that table's schema, and rejects duplicate
-keys. Insert row IDs start above the largest existing row ID; replace starts at
-zero. Updates currently rebuild the entire table in memory.
+keys. Insert row IDs start above the high-water mark stored in table metadata,
+including deleted rows; replace starts at zero. Allocation requires no row scan.
+Insert updates only affected leaves and their ancestor paths.
 
 Key columns can be comma-separated names or zero-based indexes. Their order is
 significant. For headerless CSV, pass `--has-headers false`; column names become
 `col_0`, `col_1`, etc. Empty input is rejected. All rows must have the same width.
+
+CSV input is copied to a temporary file. Inference and parsing stream that disk
+snapshot; mutations are spooled and externally sorted with an 8 MiB chunk budget
+and merge fan-in of 32. Large individual records and codec/cache buffers add to
+that budget. Objects are published only when the transaction completes.
 
 Replace mode infers types across each entire column: Int64, UInt64, Boolean,
 Float64, or Utf8. Mixed numeric/text columns remain text. Large integer values

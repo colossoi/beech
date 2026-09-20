@@ -15,7 +15,7 @@ fn main() -> Result<()> {
     };
     let table = args.next().unwrap_or_else(|| "table".into());
     conn.execute_batch(&format!(
-        "CREATE VIRTUAL TABLE data USING beech('{}', 'unused', '{}')",
+        "CREATE VIRTUAL TABLE data USING beech('{}', '{}')",
         directory.replace('\'', "''"),
         table.replace('\'', "''"),
     ))?;

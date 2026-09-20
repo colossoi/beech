@@ -1,6 +1,6 @@
 use beech_core::{query::RowCursor, BeechError, DataType, Field, NodeRef, Scalar, Table, TableSchema};
-use beech_test_fixtures::{build_simple_table, MemoryNodeSource, MemoryStore};
-use beech_write::{rebuild_with_changes, BuildOptions, Change, Writer};
+use beech_test_fixtures::{build_simple_table, MemoryStore};
+use beech_write::{apply_changes, BuildOptions, Change, Writer};
 use std::sync::Arc;
 fn schema() -> TableSchema {
     TableSchema::new(
@@ -15,10 +15,10 @@ fn schema() -> TableSchema {
 fn int_row(i: i64, v: i32) -> beech_core::Row {
     (i, vec![Scalar::Int32(i as i32), Scalar::Int32(v)])
 }
-fn collect_row_ids(source: &MemoryNodeSource, table: &Table) -> Vec<i64> {
+fn collect_row_ids(source: &beech_core::storage::Repository, table: &Table) -> Vec<i64> {
     RowCursor::new(source, table, vec![]).unwrap().map(|r| r.unwrap().0).collect()
 }
-fn collect_pairs(source: &MemoryNodeSource, table: &Table) -> Vec<(i64, i32, i32)> {
+fn collect_pairs(source: &beech_core::storage::Repository, table: &Table) -> Vec<(i64, i32, i32)> {
     RowCursor::new(source, table, vec![])
         .unwrap()
         .map(|r| {
@@ -79,7 +79,7 @@ fn merge_insert_into_existing_tree() {
         row_id: 100,
         record: vec![Scalar::Int32(100), Scalar::Int32(999)],
     }];
-    let new_root = rebuild_with_changes(
+    let new_root = apply_changes(
         changes.into_iter().peekable(),
         &table,
         &source,
@@ -87,10 +87,10 @@ fn merge_insert_into_existing_tree() {
         BuildOptions::new(64, 16).unwrap(),
     )
     .unwrap();
-    assert!(new_root.is_some());
+    assert!(new_root.root().is_some());
     writer.commit().unwrap();
 
-    let new_table = Table::new(table.name(), table.schema().clone(), new_root).unwrap();
+    let new_table = new_root;
     let ids = collect_row_ids(&store.node_source(), &new_table);
     assert_eq!(ids.len(), 11);
     assert_eq!(*ids.last().unwrap(), 100);
@@ -106,7 +106,7 @@ fn merge_update_existing_row() {
         row_id: 5,
         record: vec![Scalar::Int32(5), Scalar::Int32(7777)],
     }];
-    let new_root = rebuild_with_changes(
+    let new_root = apply_changes(
         changes.into_iter().peekable(),
         &table,
         &source,
@@ -115,7 +115,7 @@ fn merge_update_existing_row() {
     )
     .unwrap();
     writer.commit().unwrap();
-    let new_table = Table::new(table.name(), table.schema().clone(), new_root).unwrap();
+    let new_table = new_root;
     let pairs = collect_pairs(&store.node_source(), &new_table);
     let (_, _, v) = pairs.iter().find(|(_, k, _)| *k == 5).unwrap();
     assert_eq!(*v, 7777);
@@ -129,7 +129,7 @@ fn merge_delete_existing_row() {
     let changes = vec![Change::Delete {
         key: vec![Scalar::Int32(3)],
     }];
-    let new_root = rebuild_with_changes(
+    let new_root = apply_changes(
         changes.into_iter().peekable(),
         &table,
         &source,
@@ -138,7 +138,7 @@ fn merge_delete_existing_row() {
     )
     .unwrap();
     writer.commit().unwrap();
-    let new_table = Table::new(table.name(), table.schema().clone(), new_root).unwrap();
+    let new_table = new_root;
     let ids = collect_row_ids(&store.node_source(), &new_table);
     assert_eq!(ids, vec![0, 1, 2, 4, 5, 6, 7, 8, 9]);
 }
@@ -148,7 +148,7 @@ fn merge_empty_changes_returns_existing_root() {
     let (store, table, root) = build_seed_tree(10);
     let source = store.node_source();
     let mut writer = store.writer();
-    let new_root = rebuild_with_changes(
+    let new_root = apply_changes(
         std::iter::empty::<Change>().peekable(),
         &table,
         &source,
@@ -156,7 +156,7 @@ fn merge_empty_changes_returns_existing_root() {
         BuildOptions::new(64, 16).unwrap(),
     )
     .unwrap();
-    assert_eq!(new_root, Some(root));
+    assert_eq!(new_root.root(), Some(&root));
     writer.commit().unwrap();
 }
 
@@ -170,7 +170,7 @@ fn merge_full_delete_returns_no_root() {
             key: vec![Scalar::Int32(i)],
         })
         .collect();
-    let new_root = rebuild_with_changes(
+    let new_root = apply_changes(
         changes.into_iter().peekable(),
         &table,
         &source,
@@ -178,7 +178,7 @@ fn merge_full_delete_returns_no_root() {
         BuildOptions::new(64, 16).unwrap(),
     )
     .unwrap();
-    assert!(new_root.is_none());
+    assert!(new_root.root().is_none());
     writer.commit().unwrap();
 }
 
@@ -192,7 +192,7 @@ fn merge_insert_with_existing_key_errors() {
         row_id: 99,
         record: vec![Scalar::Int32(2), Scalar::Int32(999)],
     }];
-    let err = rebuild_with_changes(
+    let err = apply_changes(
         changes.into_iter().peekable(),
         &table,
         &source,
@@ -216,7 +216,7 @@ fn merge_update_unknown_key_errors() {
         row_id: 999,
         record: vec![Scalar::Int32(999), Scalar::Int32(0)],
     }];
-    let err = rebuild_with_changes(
+    let err = apply_changes(
         changes.into_iter().peekable(),
         &table,
         &source,
@@ -238,7 +238,7 @@ fn merge_delete_unknown_key_errors() {
     let changes = vec![Change::Delete {
         key: vec![Scalar::Int32(999)],
     }];
-    let err = rebuild_with_changes(
+    let err = apply_changes(
         changes.into_iter().peekable(),
         &table,
         &source,
@@ -304,14 +304,6 @@ fn malformed_changes_are_rejected_without_staging_objects() {
     let cases = vec![
         vec![
             Change::Delete {
-                key: vec![Scalar::Int32(2)],
-            },
-            Change::Delete {
-                key: vec![Scalar::Int32(1)],
-            },
-        ],
-        vec![
-            Change::Delete {
                 key: vec![Scalar::Int32(1)],
             },
             Change::Delete {
@@ -334,9 +326,7 @@ fn malformed_changes_are_rejected_without_staging_objects() {
     ];
     for changes in cases {
         let mut writer = store.writer();
-        assert!(
-            rebuild_with_changes(changes, &table, &source, &mut writer, BuildOptions::default()).is_err()
-        );
+        assert!(apply_changes(changes, &table, &source, &mut writer, BuildOptions::default()).is_err());
         assert_eq!(writer.num_to_commit(), 0);
         writer.abort().unwrap();
     }
@@ -393,7 +383,7 @@ fn empty_table_can_be_published_and_then_inserted_into() {
     let (store, source, table) = build_simple_table("t", vec![], schema(), 64, 16).unwrap();
     assert!(table.root().is_none());
     let mut writer = store.writer();
-    let root = rebuild_with_changes(
+    let root = apply_changes(
         [Change::Insert {
             key: vec![Scalar::Int32(1)],
             row_id: 7,
@@ -406,6 +396,6 @@ fn empty_table_can_be_published_and_then_inserted_into() {
     )
     .unwrap();
     writer.commit().unwrap();
-    let table = Table::new("t", schema(), root).unwrap();
+    let table = root;
     assert_eq!(collect_row_ids(&store.node_source(), &table), vec![7]);
 }

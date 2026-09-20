@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+beech-disk = { path = "../beech-disk" }
 beech-core = { path = "../beech-core" }
 beech-write = { path = "../beech-write" }
 clap = { version = "4.5.38", features = ["derive"] }
@@ -16,6 +17,5 @@ log = "0.4"
 env_logger = "0.10"
 
 [dev-dependencies]
-tempfile = "3"
 beech-sqlite3 = { path = "../beech-sqlite3" }
 rusqlite.workspace = true

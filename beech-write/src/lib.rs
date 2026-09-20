@@ -1,15 +1,18 @@
-//! Schema-driven tree construction, full-rebuild updates, and atomic snapshot publication.
+//! Schema-driven tree construction, incremental updates, and atomic snapshot publication.
 mod file;
 mod rows;
 mod snapshot;
+mod transaction;
 mod tree;
 mod update;
 use beech_core::{BeechError, Id, Result};
+pub use beech_disk::SortLimits;
 pub use file::FileWriter;
 pub use rows::batch_from_rows;
 pub use snapshot::{publish_table, Publication};
+pub use transaction::Transaction;
 pub use tree::build_table;
-pub use update::{rebuild_with_changes, Change};
+pub use update::{apply_changes, Change};
 
 /// Stage immutable objects under IDs supplied by the codecs. Existing bytes
 /// must never be overwritten. Callers must supply the correct codec-produced

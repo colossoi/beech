@@ -2,11 +2,9 @@ use anyhow::{bail, Context};
 use beech_core::{
     query::RowCursor,
     storage::{FileStore, Repository, Snapshot},
-    Id, KeyOrdering, NodeRef, NodeSource, Table,
+    Id, NodeRef, NodeSource,
 };
-use beech_write::{
-    build_table, publish_table, rebuild_with_changes, BuildOptions, Change, FileWriter, Writer,
-};
+use beech_write::{publish_table, BuildOptions, Change, FileWriter, SortLimits, Transaction, Writer};
 use clap::Parser;
 use serde::Serialize;
 use std::{
@@ -170,8 +168,16 @@ fn load_csv(
         LoadMode::Replace => {
             let fields = input.infer_fields();
             let schema = beech_core::TableSchema::new(fields.clone(), keys.to_indices(&fields)?)?;
-            let rows = input.rows(&schema, 0)?;
-            build_table(&mut writer, table_name, schema, rows, options)?
+            let mut transaction = Transaction::new(schema.clone(), SortLimits::default())?;
+            for row in input.rows(&schema, 0)? {
+                let row = row?;
+                transaction.push(Change::Insert {
+                    key: schema.key_from_row(&row)?,
+                    row_id: row.0,
+                    record: row.1,
+                })?;
+            }
+            transaction.build(table_name, &mut writer, options)?
         }
         LoadMode::Insert => {
             let snapshot = current.as_ref().context("insert requires an existing snapshot")?;
@@ -180,30 +186,17 @@ fn load_csv(
             if keys.to_indices(&fields)? != table.schema().key_columns() {
                 bail!("insert key columns must match the existing table");
             }
-            // Allocate IDs above every existing row ID, independently of key ordering.
-            let mut max_id: Option<i64> = None;
-            for row in RowCursor::new(snapshot, &table, vec![])? {
-                let id = row?.0;
-                max_id = Some(max_id.map_or(id, |old| old.max(id)));
+            let first_id = table.max_row_id().checked_add(1).context("row ID overflow")?;
+            let mut transaction = Transaction::new(table.schema().clone(), SortLimits::default())?;
+            for row in input.rows(table.schema(), first_id)? {
+                let row = row?;
+                transaction.push(Change::Insert {
+                    key: table.schema().key_from_row(&row)?,
+                    row_id: row.0,
+                    record: row.1,
+                })?;
             }
-            let first_id = match max_id {
-                Some(id) => id.checked_add(1).context("row ID overflow")?,
-                None => 0,
-            };
-            let mut changes = input
-                .rows(table.schema(), first_id)?
-                .into_iter()
-                .map(|row| {
-                    Ok(Change::Insert {
-                        key: table.schema().key_from_row(&row)?,
-                        row_id: row.0,
-                        record: row.1,
-                    })
-                })
-                .collect::<beech_core::Result<Vec<_>>>()?;
-            changes.sort_by(|a, b| a.key().compare_key(b.key()).expect("schema-validated keys"));
-            let root = rebuild_with_changes(changes, &table, snapshot, &mut writer, options)?;
-            Table::new(table.name(), table.schema().clone(), root)?
+            transaction.apply(&table, snapshot, &mut writer, options)?
         }
     };
     let publication = publish_table(&mut writer, &table, tables, previous_id)?;
@@ -224,6 +217,7 @@ struct TableInfo {
     root_node: Option<String>,
     tree_depth: u32,
     total_rows: u64,
+    max_row_id: i64,
 }
 #[derive(Serialize)]
 struct TransactionInfo {
@@ -245,6 +239,7 @@ fn info(directory: &Path) -> anyhow::Result<TransactionInfo> {
             root_node: table.root().map(|r| r.id().to_string()),
             tree_depth: table.root().map_or(0, |r| r.height()),
             total_rows: table.root().map_or(0, |r| r.row_count()),
+            max_row_id: table.max_row_id(),
         });
     }
     let duration = transaction.time().duration_since(std::time::UNIX_EPOCH)?;
@@ -273,8 +268,7 @@ fn inspect(directory: &Path, id: Id) -> anyhow::Result<NodeInspection> {
         while let Some(reference) = pending.pop() {
             if reference.id() == id {
                 let (node_type, children, keys) = if reference.height() == 0 {
-                    let leaf_table =
-                        Table::new(table.name(), table.schema().clone(), Some(reference.clone()))?;
+                    let leaf_table = table.with_root(Some(reference.clone()))?;
                     let keys = RowCursor::new(&snapshot, &leaf_table, vec![])?
                         .map(|row| Ok(format!("{:?}", table.schema().key_from_row(&row?)?)))
                         .collect::<beech_core::Result<Vec<_>>>()?;

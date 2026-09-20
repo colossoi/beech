@@ -87,29 +87,11 @@ impl Read for ObjectReader {
                 bytes[..n].copy_from_slice(&remaining[..n]);
                 n
             }
-            Data::File(file, _) => read_at(file, bytes, self.position)?,
+            Data::File(file, _) => beech_disk::read_at(file, bytes, self.position)?,
         };
         self.position =
             self.position.checked_add(n as u64).ok_or_else(|| io::Error::other("file offset overflow"))?;
         Ok(n)
-    }
-}
-fn read_at(file: &File, bytes: &mut [u8], offset: u64) -> io::Result<usize> {
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::FileExt::read_at(file, bytes, offset)
-    }
-    #[cfg(windows)]
-    {
-        std::os::windows::fs::FileExt::seek_read(file, bytes, offset)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (file, bytes, offset);
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "positional file reads require Unix or Windows",
-        ))
     }
 }
 

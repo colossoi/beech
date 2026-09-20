@@ -7,7 +7,7 @@ use beech_core::{
     storage::{FileStore, Repository},
     *,
 };
-use std::{collections::BTreeMap, path::Path, sync::Arc, time::UNIX_EPOCH};
+use std::{collections::BTreeMap, io::Write, path::Path, sync::Arc, time::UNIX_EPOCH};
 use support::{MemoryStore, batch_from_rows};
 fn schema() -> TableSchema {
     TableSchema::new(
@@ -20,8 +20,18 @@ fn schema() -> TableSchema {
     .unwrap()
 }
 fn save(store: &FileStore, object: &codec::EncodedObject) -> Result<Id> {
-    std::fs::write(store.object_path(&object.id()), object.bytes())?;
+    save_bytes(&store.object_path(&object.id()), object.bytes())?;
     Ok(object.id())
+}
+fn save_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    match beech_disk::atomic_write(path, |file| file.write_all(bytes)) {
+        Err(error)
+            if error.kind() == std::io::ErrorKind::AlreadyExists && std::fs::metadata(path)?.is_file() =>
+        {
+            Ok(())
+        }
+        result => result,
+    }
 }
 fn decimal_schema() -> TableSchema {
     TableSchema::new(
@@ -79,7 +89,12 @@ fn verify_decimals(dir: &Path) -> Result<()> {
         let store = Arc::new(MemoryStore::default());
         store.put(id, std::fs::read(dir.join(format!("{name}.parquet")))?)?;
         let reference = NodeRef::new(&s, id, 0, 6, s.key_from_row(expected.last().unwrap())?)?;
-        let table = Table::new("decimals", s.clone(), Some(reference))?;
+        let table = Table::new(
+            "decimals",
+            s.clone(),
+            Some(reference),
+            expected.iter().map(|r| r.0).max().unwrap(),
+        )?;
         let source = Repository::with_options(
             store,
             storage::RepositoryOptions {
@@ -121,12 +136,17 @@ fn write(dir: &Path) -> Result<()> {
     let mut children = vec![];
     for chunk in rows.chunks(2) {
         let node = codec::parquet::encode_leaf(&s, &batch_from_rows(&s, chunk)?)?;
-        std::fs::write(store.object_path(&node.reference().id()), node.bytes())?;
+        save_bytes(&store.object_path(&node.reference().id()), node.bytes())?;
         children.push(node.reference().clone());
     }
     let node = codec::thrift::encode_internal(&InternalNode::new(&s, 1, children)?, &s)?;
-    std::fs::write(store.object_path(&node.reference().id()), node.bytes())?;
-    let table = Table::new("example", s.clone(), Some(node.reference().clone()))?;
+    save_bytes(&store.object_path(&node.reference().id()), node.bytes())?;
+    let table = Table::new(
+        "example",
+        s.clone(),
+        Some(node.reference().clone()),
+        rows.iter().map(|r| r.0).max().unwrap(),
+    )?;
     let table_id = save(&store, &codec::thrift::encode_table(&table)?)?;
     let txn = Transaction::new(
         Id::default(),
@@ -135,7 +155,7 @@ fn write(dir: &Path) -> Result<()> {
     )?;
     let txn_id = save(&store, &codec::thrift::encode_transaction(&txn)?)?;
     let root_id = save(&store, &codec::thrift::encode_root(&Root::new(txn_id))?)?;
-    std::fs::write(dir.join("root-id.txt"), root_id.to_string())?;
+    beech_disk::atomic_replace(&dir.join("root-id.txt"), root_id.to_string().as_bytes())?;
     std::fs::write(
         dir.join("schema.thrift"),
         codec::thrift::encode_schema(&s)?.bytes(),
@@ -161,6 +181,7 @@ fn verify(dir: &Path) -> Result<()> {
         "python",
         s.clone(),
         Some(NodeRef::new(&s, id, 0, 4, vec![Scalar::Int64(9)])?),
+        1009,
     )?;
     let source = Repository::with_options(
         store,

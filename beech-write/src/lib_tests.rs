@@ -21,7 +21,7 @@ fn publish(dir: &std::path::Path) -> Publication {
 }
 #[test]
 fn validation_happens_before_staging() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = beech_disk::Workspace::new().unwrap();
     let mut w = FileWriter::new(dir.path()).unwrap();
     assert!(BuildOptions::new(0, 1).is_err());
     assert!(BuildOptions::new(1, 0).is_err());
@@ -35,7 +35,7 @@ fn validation_happens_before_staging() {
 }
 #[test]
 fn publish_reopens_root_and_parquet_rows() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = beech_disk::Workspace::new().unwrap();
     let publication = publish(dir.path());
     assert_eq!(
         fs::read_to_string(dir.path().join("root")).unwrap(),
@@ -53,7 +53,7 @@ fn publish_reopens_root_and_parquet_rows() {
 }
 #[test]
 fn abort_and_drop_preserve_committed_data() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = beech_disk::Workspace::new().unwrap();
     let first = publish(dir.path());
     let original = fs::read(dir.path().join("root")).unwrap();
     for explicit_abort in [true, false] {
@@ -73,7 +73,7 @@ fn abort_and_drop_preserve_committed_data() {
 }
 #[test]
 fn reusing_objects_never_stages_overwrites_or_deletes_them() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = beech_disk::Workspace::new().unwrap();
     let first = publish(dir.path());
     let original = fs::read(dir.path().join(first.root_id.to_string())).unwrap();
     let mut w = FileWriter::new(dir.path()).unwrap();
@@ -88,7 +88,7 @@ fn reusing_objects_never_stages_overwrites_or_deletes_them() {
 }
 #[test]
 fn failed_commit_preserves_root() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = beech_disk::Workspace::new().unwrap();
     publish(dir.path());
     let original = fs::read(dir.path().join("root")).unwrap();
     let mut w = FileWriter::new(dir.path()).unwrap();
@@ -102,7 +102,7 @@ fn failed_commit_preserves_root() {
 }
 #[test]
 fn writer_lock_is_exclusive_and_released_on_drop() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = beech_disk::Workspace::new().unwrap();
     let w = FileWriter::new(dir.path()).unwrap();
     assert!(FileWriter::new(dir.path()).is_err());
     drop(w);
@@ -110,7 +110,7 @@ fn writer_lock_is_exclusive_and_released_on_drop() {
 }
 #[test]
 fn snapshot_replacement_retains_other_tables_and_history() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = beech_disk::Workspace::new().unwrap();
     let first = publish(dir.path());
     let mut w = FileWriter::new(dir.path()).unwrap();
     let repository = Repository::new(FileStore::new(dir.path()));
@@ -135,7 +135,7 @@ fn snapshot_replacement_retains_other_tables_and_history() {
 }
 #[test]
 fn cannot_stage_missing_root() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = beech_disk::Workspace::new().unwrap();
     let mut w = FileWriter::new(dir.path()).unwrap();
     let root = codec::thrift::encode_root(&beech_core::Root::new(Id::default())).unwrap();
     assert!(w.stage_root(root.id()).is_err());
@@ -145,7 +145,7 @@ fn cannot_stage_missing_root() {
 
 #[test]
 fn commit_reuses_object_that_appeared_after_staging() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = beech_disk::Workspace::new().unwrap();
     let object = codec::thrift::encode_root(&beech_core::Root::new(Id::default())).unwrap();
     let mut writer = FileWriter::new(dir.path()).unwrap();
     writer.put(object.id(), object.bytes()).unwrap();
@@ -164,7 +164,7 @@ fn commit_reuses_object_that_appeared_after_staging() {
 #[test]
 fn reuse_does_not_require_reading_existing_object_contents() {
     use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = beech_disk::Workspace::new().unwrap();
     let object = codec::thrift::encode_root(&beech_core::Root::new(Id::default())).unwrap();
     let path = dir.path().join(object.id().to_string());
     fs::write(&path, object.bytes()).unwrap();

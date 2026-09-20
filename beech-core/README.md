@@ -89,7 +89,7 @@ Then, from the repository root in the SQLite shell:
 .load ./target/debug/beech_sqlite3
 .headers on
 .mode column
-CREATE VIRTUAL TABLE items USING beech('target/sqlite-demo', 'unused', 'example');
+CREATE VIRTUAL TABLE items USING beech('target/sqlite-demo', 'example');
 SELECT count(*) FROM items;
 SELECT rowid, key, label FROM items WHERE key >= 3 ORDER BY key;
 ```

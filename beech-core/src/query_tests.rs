@@ -252,6 +252,7 @@ fn non_key_statistics_skip_groups_and_missing_stats_read_rows() {
             row_count: 12,
             max_key: vec![Scalar::Int64(11)],
         }),
+        10011,
     )
     .unwrap();
     let src = Repository::new(store);
@@ -381,7 +382,7 @@ fn narrow_projection_retains_less_decoded_data_and_local_files_work() {
     );
     let wide = src.stats().unwrap().columns.bytes;
     assert!(narrow * 4 < wide, "narrow={narrow}, wide={wide}");
-    let dir = tempfile::tempdir().unwrap();
+    let dir = beech_disk::Workspace::new().unwrap();
     let files = FileStore::new(dir.path());
     std::fs::write(files.object_path(&nodes[0].reference.id), &nodes[0].bytes).unwrap();
     let src = Repository::with_options(
@@ -399,7 +400,7 @@ fn narrow_projection_retains_less_decoded_data_and_local_files_work() {
 #[test]
 fn corrupt_parquet_and_hash_mismatch_are_errors() {
     let (table, _, nodes) = build(&schema(), &rows(2), 3, 2);
-    let dir = tempfile::tempdir().unwrap();
+    let dir = beech_disk::Workspace::new().unwrap();
     let files = FileStore::new(dir.path());
     let r = table.root.as_ref().unwrap();
     let mut bytes = nodes[0].bytes.to_vec();

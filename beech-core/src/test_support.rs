@@ -42,12 +42,18 @@ pub fn build(
         .chunks(leaf_rows)
         .map(|chunk| codec::parquet::encode_leaf(schema, &batch_from_rows(schema, chunk).unwrap()).unwrap())
         .collect();
-    finish(schema, leaves, fanout)
+    finish(
+        schema,
+        leaves,
+        fanout,
+        rows.iter().map(|r| r.0).max().unwrap_or(-1),
+    )
 }
 fn finish(
     schema: &TableSchema,
     leaves: Vec<EncodedNode>,
     fanout: usize,
+    max_row_id: i64,
 ) -> (Table, Arc<MemoryStore>, Vec<EncodedNode>) {
     let store = Arc::new(MemoryStore::default());
     let mut objects = leaves;
@@ -78,7 +84,7 @@ fn finish(
             .collect();
     }
     (
-        Table::new("items", schema.clone(), level.pop()).unwrap(),
+        Table::new("items", schema.clone(), level.pop(), max_row_id).unwrap(),
         store,
         objects,
     )
@@ -145,7 +151,13 @@ pub fn build_prolly(schema: &TableSchema, rows: &[Row]) -> (Table, Arc<MemorySto
             .collect();
     }
     (
-        Table::new("items", schema.clone(), level.pop()).unwrap(),
+        Table::new(
+            "items",
+            schema.clone(),
+            level.pop(),
+            rows.iter().map(|r| r.0).max().unwrap_or(-1),
+        )
+        .unwrap(),
         store,
         objects,
     )

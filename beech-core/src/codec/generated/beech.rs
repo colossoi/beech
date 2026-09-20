@@ -699,10 +699,11 @@ pub struct Table {
     pub name: String,
     pub schema: Schema,
     pub root: Option<NodeRef>,
+    pub max_row_id: i64,
 }
 
 impl Table {
-    pub fn new<F3>(name: String, schema: Schema, root: F3) -> Table
+    pub fn new<F3>(name: String, schema: Schema, root: F3, max_row_id: i64) -> Table
     where
         F3: Into<Option<NodeRef>>,
     {
@@ -710,6 +711,7 @@ impl Table {
             name,
             schema,
             root: root.into(),
+            max_row_id,
         }
     }
 }
@@ -720,6 +722,7 @@ impl TSerializable for Table {
         let mut f_1: Option<String> = None;
         let mut f_2: Option<Schema> = None;
         let mut f_3: Option<NodeRef> = None;
+        let mut f_4: Option<i64> = None;
         loop {
             let field_ident = i_prot.read_field_begin()?;
             if field_ident.field_type == TType::Stop {
@@ -739,6 +742,10 @@ impl TSerializable for Table {
                     let val = NodeRef::read_from_in_protocol(i_prot)?;
                     f_3 = Some(val);
                 }
+                4 => {
+                    let val = i_prot.read_i64()?;
+                    f_4 = Some(val);
+                }
                 _ => {
                     i_prot.skip(field_ident.field_type)?;
                 }
@@ -748,10 +755,13 @@ impl TSerializable for Table {
         i_prot.read_struct_end()?;
         verify_required_field_exists("Table.name", &f_1)?;
         verify_required_field_exists("Table.schema", &f_2)?;
+        verify_required_field_exists("Table.max_row_id", &f_4)?;
         let ret = Table {
             name: f_1.expect("auto-generated code should have checked for presence of required fields"),
             schema: f_2.expect("auto-generated code should have checked for presence of required fields"),
             root: f_3,
+            max_row_id: f_4
+                .expect("auto-generated code should have checked for presence of required fields"),
         };
         Ok(ret)
     }
@@ -769,6 +779,9 @@ impl TSerializable for Table {
             fld_var.write_to_out_protocol(o_prot)?;
             o_prot.write_field_end()?
         }
+        o_prot.write_field_begin(&TFieldIdentifier::new("max_row_id", TType::I64, 4))?;
+        o_prot.write_i64(self.max_row_id)?;
+        o_prot.write_field_end()?;
         o_prot.write_field_stop()?;
         o_prot.write_struct_end()
     }

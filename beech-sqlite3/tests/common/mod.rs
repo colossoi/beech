@@ -8,8 +8,8 @@ use beech_core::{
         thrift::{encode_internal, encode_root, encode_table, encode_transaction},
     },
 };
+use beech_disk::Workspace;
 use std::{collections::BTreeMap, path::Path, time::UNIX_EPOCH};
-use tempfile::TempDir;
 
 #[path = "../../../beech-core/tests/support/mod.rs"]
 mod support;
@@ -17,7 +17,7 @@ mod support;
 pub type IntRecord = Vec<(&'static str, i32)>;
 
 /// Existing integer fixtures, now encoded with the core Parquet/Thrift codecs.
-pub fn make_test_tree(rows: Vec<(i64, IntRecord)>, key_columns: Vec<usize>, table_name: &str) -> TempDir {
+pub fn make_test_tree(rows: Vec<(i64, IntRecord)>, key_columns: Vec<usize>, table_name: &str) -> Workspace {
     let fields = rows[0].1.iter().map(|(name, _)| Field::new(*name, DataType::Int32, false)).collect();
     let schema = TableSchema::new(fields, key_columns).unwrap();
     let rows = rows
@@ -32,8 +32,8 @@ pub fn make_test_tree(rows: Vec<(i64, IntRecord)>, key_columns: Vec<usize>, tabl
     make_tree(&schema, &rows, table_name)
 }
 
-pub fn make_tree(schema: &TableSchema, rows: &[Row], table_name: &str) -> TempDir {
-    let tmp = TempDir::new().unwrap();
+pub fn make_tree(schema: &TableSchema, rows: &[Row], table_name: &str) -> Workspace {
+    let tmp = Workspace::new().unwrap();
     write_tree(tmp.path(), schema, rows, table_name);
     tmp
 }
@@ -59,7 +59,13 @@ pub fn write_tree(dir: &Path, schema: &TableSchema, rows: &[Row], table_name: &s
             })
             .collect();
     }
-    let table = Table::new(table_name, schema.clone(), nodes.pop()).unwrap();
+    let table = Table::new(
+        table_name,
+        schema.clone(),
+        nodes.pop(),
+        rows.iter().map(|r| r.0).max().unwrap_or(-1),
+    )
+    .unwrap();
     let table_id = save(dir, encode_table(&table).unwrap());
     let transaction = Transaction::new(
         Id::default(),
@@ -91,7 +97,7 @@ pub fn setup_vtab(dir: &Path, table_name: &str, local_name: &str) -> rusqlite::C
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     beech_sqlite3::create_beech_module(&conn).unwrap();
     conn.execute_batch(&format!(
-        "CREATE VIRTUAL TABLE \"{}\" USING beech('{}', 'unused', '{}')",
+        "CREATE VIRTUAL TABLE \"{}\" USING beech('{}', '{}')",
         local_name.replace('"', "\"\""),
         dir.display().to_string().replace('\'', "''"),
         table_name.replace('\'', "''"),

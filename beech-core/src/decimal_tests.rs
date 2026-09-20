@@ -89,7 +89,7 @@ fn decimal_tree_roundtrip_preserves_nulls_boundaries_and_all_38_digits() {
     );
     let encoded = codec::thrift::encode_schema(&s).unwrap();
     assert_eq!(codec::thrift::decode_schema(encoded.bytes()).unwrap(), s);
-    let empty = Table::new("empty", s.clone(), None).unwrap();
+    let empty = Table::new("empty", s.clone(), None, -1).unwrap();
     assert_eq!(
         codec::thrift::decode_table(codec::thrift::encode_table(&empty).unwrap().bytes()).unwrap(),
         empty
@@ -278,7 +278,13 @@ fn independent_decimal_files_preserve_values_and_prune_all_physical_widths() {
         let store = test_support::MemoryStore::default();
         store.put(id, bytes::Bytes::copy_from_slice(bytes)).unwrap();
         let root = NodeRef::new(&s, id, 0, 6, s.key_from_row(expected.last().unwrap()).unwrap()).unwrap();
-        let table = Table::new("python-decimal", s.clone(), Some(root)).unwrap();
+        let table = Table::new(
+            "python-decimal",
+            s.clone(),
+            Some(root),
+            expected.iter().map(|r| r.0).max().unwrap(),
+        )
+        .unwrap();
         let source = Repository::with_options(
             store,
             storage::RepositoryOptions {

@@ -3,7 +3,7 @@
 //! Register with [create_beech_module], then:
 //!
 //! ```sql
-//! CREATE VIRTUAL TABLE items USING beech('path/to/data', 'unused', 'items');
+//! CREATE VIRTUAL TABLE items USING beech('path/to/data', 'items');
 //! ```
 //!
 //! The directory contains objects named by hexadecimal content ID and a text
@@ -35,7 +35,6 @@ use rusqlite::{
 };
 use std::{
     borrow::Cow,
-    collections::HashMap,
     ffi::{CStr, CString, c_int},
     path::Path,
     sync::Arc,
@@ -86,12 +85,11 @@ unsafe impl<'vtab> VTab<'vtab> for BeechTable {
         args: &[&[u8]],
     ) -> Result<(Cow<'static, CStr>, Self)> {
         let args = args.iter().map(|a| parse_arg(a)).collect::<Result<Vec<_>>>()?;
-        let [data_path, _source_name, table_name, options @ ..] = args.as_slice() else {
+        let [data_path, table_name] = args.as_slice() else {
             return Err(rusqlite::Error::ModuleError(
-                "Usage: CREATE VIRTUAL TABLE name USING beech(data_path, source_name, table_name [, options...])".into(),
+                "Usage: CREATE VIRTUAL TABLE name USING beech(data_path, table_name)".into(),
             ));
         };
-        let _options = parse_options(options);
         let vtab = Self::connect_snapshot(data_path, table_name).map_err(into_rusqlite_error)?;
         let columns = vtab
             .table
@@ -401,15 +399,6 @@ fn parse_arg(arg: &[u8]) -> Result<String> {
     Ok(arg.into())
 }
 
-fn parse_options(args: &[String]) -> HashMap<String, String> {
-    args.iter()
-        .map(|arg| {
-            let (key, value) = arg.split_once('=').unwrap_or((arg, ""));
-            (key.to_owned(), value.to_owned())
-        })
-        .collect()
-}
-
 fn to_hex(data: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(data.len() * 2);
@@ -464,9 +453,6 @@ mod tests {
 
     #[test]
     fn test_argument_parsing() {
-        let options = parse_options(&["key1=value1".into(), "key2=value2".into()]);
-        assert_eq!(options.get("key1").map(String::as_str), Some("value1"));
-        assert_eq!(options.get("key2").map(String::as_str), Some("value2"));
         assert_eq!(parse_arg(b"'a''b'").unwrap(), "a'b");
     }
 

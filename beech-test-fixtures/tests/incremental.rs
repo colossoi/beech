@@ -1,0 +1,205 @@
+use beech_core::{
+    query::RowCursor,
+    storage::{Leaf, Repository},
+    DataType, Field, Id, InternalNode, NodeRef, NodeSource, Result, Row, Scalar, Table, TableSchema,
+};
+use beech_test_fixtures::build_simple_table;
+use beech_write::{apply_changes, BuildOptions, Change, Writer};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::{Arc, Mutex},
+};
+fn schema() -> TableSchema {
+    TableSchema::new(
+        vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("value", DataType::Int32, false),
+        ],
+        vec![0],
+    )
+    .unwrap()
+}
+fn row(key: i32, value: i32) -> Row {
+    (i64::from(key), vec![Scalar::Int32(key), Scalar::Int32(value)])
+}
+fn read(source: &impl NodeSource, table: &Table) -> Vec<Row> {
+    RowCursor::new(source, table, vec![]).unwrap().collect::<Result<_>>().unwrap()
+}
+struct PathOnly<'a> {
+    source: &'a Repository,
+    allowed: HashSet<Id>,
+    visited: Mutex<HashSet<Id>>,
+}
+impl NodeSource for PathOnly<'_> {
+    fn get_internal(&self, r: &NodeRef, s: &TableSchema) -> Result<Arc<InternalNode>> {
+        assert!(self.allowed.contains(&r.id()), "read outside the edited path");
+        self.visited.lock().unwrap().insert(r.id());
+        self.source.get_internal(r, s)
+    }
+    fn open_leaf(&self, r: &NodeRef, s: &TableSchema) -> Result<Leaf> {
+        assert!(self.allowed.contains(&r.id()), "read an unaffected leaf");
+        self.visited.lock().unwrap().insert(r.id());
+        self.source.open_leaf(r, s)
+    }
+}
+#[test]
+fn point_update_and_noop_only_read_the_affected_path() {
+    let rows: Vec<_> = (0..1000).map(|i| row(i, i)).collect();
+    let (store, source, table) = build_simple_table("t", rows.clone(), schema(), 256, 64).unwrap();
+    let mut reference = table.root().unwrap().clone();
+    assert!(reference.height() > 1);
+    let mut allowed = HashSet::new();
+    loop {
+        allowed.insert(reference.id());
+        if reference.height() == 0 {
+            break;
+        }
+        let node = source.get_internal(&reference, table.schema()).unwrap();
+        let index = node.seek(table.schema(), &vec![Scalar::Int32(500)]).unwrap().unwrap();
+        reference = node.children()[index].clone();
+    }
+    let checked = PathOnly {
+        source: &source,
+        allowed,
+        visited: Mutex::new(HashSet::new()),
+    };
+    let mut writer = store.writer();
+    let change = |value| Change::Update {
+        key: vec![Scalar::Int32(500)],
+        row_id: 500,
+        record: row(500, value).1,
+    };
+    let unchanged = apply_changes(
+        [change(500)],
+        &table,
+        &checked,
+        &mut writer,
+        BuildOptions::new(256, 64).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(&unchanged, table.as_ref());
+    assert_eq!(writer.num_to_commit(), 0);
+    let root = apply_changes(
+        [change(501)],
+        &table,
+        &checked,
+        &mut writer,
+        BuildOptions::new(256, 64).unwrap(),
+    )
+    .unwrap();
+    writer.commit().unwrap();
+    assert_eq!(*checked.visited.lock().unwrap(), checked.allowed);
+    let updated = root;
+    let mut expected = rows.clone();
+    expected[500] = row(500, 501);
+    assert_eq!(read(&source, &updated), expected);
+    assert_eq!(read(&source, &table), rows); // Old snapshot remains intact.
+}
+#[test]
+fn mixed_edits_match_a_row_model_through_growth_and_deletion() {
+    for options in [
+        BuildOptions::new(1, 1).unwrap(),
+        BuildOptions::new(128, 32).unwrap(),
+    ] {
+        let (store, source, initial) = build_simple_table("t", vec![], schema(), 128, 32).unwrap();
+        let mut table = (*initial).clone();
+        let mut model = BTreeMap::new();
+        let mut seed = 7u32;
+        for round in 0..60 {
+            let mut changes = BTreeMap::new();
+            for _ in 0..4 {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let key = (seed % 80) as i32;
+                if changes.contains_key(&key) {
+                    continue;
+                }
+                let k = vec![Scalar::Int32(key)];
+                let previous = model.remove(&key);
+                let change = if previous.is_some() && seed.is_multiple_of(3) {
+                    Change::Delete { key: k }
+                } else {
+                    model.insert(key, row(key, round));
+                    if previous.is_some() {
+                        Change::Update {
+                            key: k,
+                            row_id: i64::from(key),
+                            record: row(key, round).1,
+                        }
+                    } else {
+                        Change::Insert {
+                            key: k,
+                            row_id: i64::from(key),
+                            record: row(key, round).1,
+                        }
+                    }
+                };
+                changes.insert(key, change);
+            }
+            let mut writer = store.writer();
+            let root = apply_changes(changes.into_values(), &table, &source, &mut writer, options).unwrap();
+            writer.commit().unwrap();
+            table = root;
+            assert_eq!(read(&source, &table), model.values().cloned().collect::<Vec<_>>());
+            assert_eq!(table.root().map_or(0, |r| r.row_count()), model.len() as u64);
+        }
+        let mut writer = store.writer();
+        let root = apply_changes(
+            model.keys().map(|&k| Change::Delete {
+                key: vec![Scalar::Int32(k)],
+            }),
+            &table,
+            &source,
+            &mut writer,
+            options,
+        )
+        .unwrap();
+        assert!(root.root().is_none());
+        writer.commit().unwrap();
+    }
+}
+
+#[test]
+fn disk_transaction_sorts_a_large_append_and_preserves_the_old_snapshot() {
+    use beech_write::{SortLimits, Transaction};
+    let (store, source, table) = build_simple_table("t", vec![row(0, 0)], schema(), 256, 64).unwrap();
+    let mut transaction = Transaction::new(schema(), SortLimits::new(512, 3).unwrap()).unwrap();
+    for key in (1..2000).rev() {
+        let row = row(key, key);
+        transaction
+            .push(Change::Insert {
+                key: vec![Scalar::Int32(key)],
+                row_id: row.0,
+                record: row.1,
+            })
+            .unwrap();
+    }
+    let mut writer = store.writer();
+    let updated =
+        transaction.apply(&table, &source, &mut writer, BuildOptions::new(256, 64).unwrap()).unwrap();
+    writer.commit().unwrap();
+    assert_eq!(updated.max_row_id(), 1999);
+    assert_eq!(
+        read(&source, &updated),
+        (0..2000).map(|key| row(key, key)).collect::<Vec<_>>()
+    );
+    assert_eq!(read(&source, &table), vec![row(0, 0)]);
+}
+
+#[test]
+fn duplicate_changes_in_different_sort_runs_fail_before_object_writes() {
+    use beech_write::{SortLimits, Transaction};
+    let (store, source, table) = build_simple_table("t", vec![row(0, 0)], schema(), 256, 64).unwrap();
+    let mut transaction = Transaction::new(schema(), SortLimits::new(1, 2).unwrap()).unwrap();
+    for key in [10, 2, 7, 10] {
+        transaction
+            .push(Change::Insert {
+                key: vec![Scalar::Int32(key)],
+                row_id: key as i64,
+                record: row(key, key).1,
+            })
+            .unwrap();
+    }
+    let mut writer = store.writer();
+    assert!(transaction.apply(&table, &source, &mut writer, BuildOptions::default()).is_err());
+    assert_eq!(writer.num_to_commit(), 0);
+}

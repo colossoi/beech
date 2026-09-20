@@ -23,7 +23,7 @@ fn table(row_count: u64) -> Table {
         )
         .unwrap()
     });
-    Table::new("t", schema, root).unwrap()
+    Table::new("t", schema, root, row_count as i64 - 1).unwrap()
 }
 fn cc(column: usize, op: Op) -> CandidateConstraint {
     CandidateConstraint { column, op }

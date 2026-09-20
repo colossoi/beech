@@ -3,12 +3,12 @@ use common::*;
 
 #[test]
 fn missing_root_file_surfaces_error() {
-    let tmp = tempfile::TempDir::new().unwrap();
+    let tmp = beech_disk::Workspace::new().unwrap();
     // No tree written — root file doesn't exist.
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     beech_sqlite3::create_beech_module(&conn).unwrap();
     let sql = format!(
-        "CREATE VIRTUAL TABLE tt USING beech('{}', 'unused', 'table')",
+        "CREATE VIRTUAL TABLE tt USING beech('{}', 'table')",
         tmp.path().display(),
     );
     let result = conn.execute_batch(&sql);
@@ -23,7 +23,7 @@ fn missing_table_in_transaction_surfaces_not_found() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     beech_sqlite3::create_beech_module(&conn).unwrap();
     let sql = format!(
-        "CREATE VIRTUAL TABLE tt USING beech('{}', 'unused', 'nonexistent')",
+        "CREATE VIRTUAL TABLE tt USING beech('{}', 'nonexistent')",
         tmp.path().display(),
     );
     let result = conn.execute_batch(&sql);
@@ -47,4 +47,20 @@ fn missing_leaf_surfaces_its_id_during_query() {
     std::fs::remove_file(tmp.path().join(leaf_id.to_string())).unwrap();
     let error = conn.query_row("SELECT k FROM tt", [], |r| r.get::<_, i32>(0)).unwrap_err();
     assert!(error.to_string().contains(&leaf_id.to_string()), "{error}");
+}
+
+#[test]
+fn module_rejects_ignored_arguments() {
+    let tmp = make_test_tree(vec![int_row(0, 0)], vec![0], "t");
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    beech_sqlite3::create_beech_module(&conn).unwrap();
+    for args in ["'unused', 't'", "'t', 'option=value'"] {
+        let error = conn
+            .execute_batch(&format!(
+                "CREATE VIRTUAL TABLE tt USING beech('{}', {args})",
+                tmp.path().display()
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains("Usage:"), "{error}");
+    }
 }

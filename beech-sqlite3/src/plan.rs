@@ -250,7 +250,7 @@ mod tests {
             )
             .unwrap()
         });
-        Table::new("t", schema, root).unwrap()
+        Table::new("t", schema, root, row_count as i64 - 1).unwrap()
     }
     fn cc(column: usize, op: Op) -> CandidateConstraint {
         CandidateConstraint { column, op }

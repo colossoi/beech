@@ -438,7 +438,7 @@ fn loading_panic_releases_coordination_for_retry() {
 #[test]
 fn concurrent_file_ranges_use_independent_offsets() {
     use std::io::Read;
-    let directory = tempfile::tempdir().unwrap();
+    let directory = beech_disk::Workspace::new().unwrap();
     let path = directory.path().join("object");
     let bytes = (0..8192).map(|i| ((i * 31) ^ (i >> 8)) as u8).collect::<Vec<_>>();
     std::fs::write(&path, &bytes).unwrap();
@@ -477,7 +477,7 @@ fn positional_read_errors_reach_callers_and_parquet() {
     let schema = schema();
     let node =
         crate::codec::parquet::encode_leaf(&schema, &batch_from_rows(&schema, &rows(2)).unwrap()).unwrap();
-    let directory = tempfile::tempdir().unwrap();
+    let directory = beech_disk::Workspace::new().unwrap();
     let path = directory.path().join("leaf");
     std::fs::write(&path, node.bytes()).unwrap();
     let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
@@ -495,7 +495,7 @@ fn positional_read_errors_reach_callers_and_parquet() {
 #[test]
 fn interleaved_file_readers_have_independent_positions() {
     use std::io::Read;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = beech_disk::Workspace::new().unwrap();
     let path = dir.path().join("bytes");
     std::fs::write(&path, b"0123456789abcdef").unwrap();
     let file = ObjectFile::from_file(std::fs::File::open(path).unwrap()).unwrap();

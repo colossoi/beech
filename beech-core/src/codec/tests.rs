@@ -32,7 +32,7 @@ fn schema_and_empty_table_round_trip_preserve_key_positions() {
     .unwrap();
     let bytes = codec::thrift::encode_schema(&s).unwrap();
     assert_eq!(codec::thrift::decode_schema(bytes.bytes()).unwrap(), s);
-    let t = Table::new("empty", s, None).unwrap();
+    let t = Table::new("empty", s, None, -1).unwrap();
     assert_eq!(
         codec::thrift::decode_table(codec::thrift::encode_table(&t).unwrap().bytes()).unwrap(),
         t
@@ -191,6 +191,7 @@ fn independently_written_pyarrow_leaf_is_readable() {
             row_count: 4,
             max_key: vec![Scalar::Int64(9)],
         }),
+        1009,
     )
     .unwrap();
     let source = Repository::new(store);
@@ -281,4 +282,21 @@ fn hash_binds_kind_and_content() {
         codec::object_id(FormatTag::Leaf, b"x"),
         codec::object_id(FormatTag::Leaf, b"y")
     );
+}
+
+#[test]
+fn table_requires_row_id_high_water_mark() {
+    let table = Table::new("t", schema(), None, 42).unwrap();
+    let encoded = codec::thrift::encode_table(&table).unwrap();
+    assert_eq!(
+        codec::thrift::decode_table(encoded.bytes()).unwrap().max_row_id(),
+        42
+    );
+    // Field 4 is the final i64 field, followed by the struct STOP byte.
+    let mut missing = encoded.bytes().to_vec();
+    assert_eq!(&missing[missing.len() - 3..], &[0x26, 84, 0]);
+    missing.truncate(missing.len() - 3);
+    missing.push(0);
+    let error = codec::thrift::decode_table(&missing).unwrap_err();
+    assert!(format!("{error:?}").contains("max_row_id"), "{error:?}");
 }

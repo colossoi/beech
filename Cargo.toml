@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["beech-core", "beech-mem", "beech-shaper", "beech-sqlite3", "beech-cli", "beech-write", "beech-sqlite3-test", "beech-test-fixtures"]
+members = ["beech-disk", "beech-core", "beech-mem", "beech-shaper", "beech-sqlite3", "beech-cli", "beech-write", "beech-sqlite3-test", "beech-test-fixtures"]
 
 [workspace.dependencies]
 rusqlite = { version = "0.40.2", features = ["vtab"] }

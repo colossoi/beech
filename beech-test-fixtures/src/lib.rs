@@ -14,7 +14,6 @@ type Files = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 pub struct MemoryStore {
     files: Files,
 }
-pub type MemoryNodeSource = Repository;
 impl MemoryStore {
     pub fn new() -> Self {
         Self::default()
@@ -104,7 +103,7 @@ pub fn build_simple_table(
     schema: TableSchema,
     target: usize,
     stddev: usize,
-) -> Result<(MemoryStore, MemoryNodeSource, Arc<Table>)> {
+) -> Result<(MemoryStore, Repository, Arc<Table>)> {
     let store = MemoryStore::new();
     let mut writer = store.writer();
     let table = beech_write::build_table(

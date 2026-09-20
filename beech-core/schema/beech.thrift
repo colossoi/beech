@@ -29,7 +29,7 @@ struct Column {
   2: required i32 data_type,
   3: required bool nullable
   // Required for Decimal128 (1 <= precision <= 38, 0 <= scale <= precision).
-  // Absent for all other types, preserving their canonical bytes.
+  // Absent for all other types.
   4: optional i32 precision,
   5: optional i32 scale
 }
@@ -56,7 +56,9 @@ struct InternalNode {
 struct Table {
   1: required string name,
   2: required Schema schema,
-  3: optional NodeRef root
+  3: optional NodeRef root,
+  // Highest row ID assigned, retained after deletion; -1 for a new empty table.
+  4: required i64 max_row_id
 }
 
 struct TableRef {

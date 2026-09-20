@@ -174,6 +174,14 @@ pub fn encode_key(key: &Key) -> Result<Vec<u8>> {
         ),
     )
 }
+/// Decode the canonical scalar sequence used for keys and transaction scratch records.
+pub fn decode_key(bytes: &[u8]) -> Result<Key> {
+    let key: g::NodeRef = decode(FormatTag::Key, bytes)?;
+    if key.id != vec![0; 32] || key.height != 0 || key.row_count != 0 {
+        bail!(Wire, "invalid key framing");
+    }
+    key.max_key.into_iter().map(from_scalar).collect()
+}
 pub fn encode_row_for_splitting(row: &Row) -> Result<Vec<u8>> {
     // Retain full-row boundary input, including the row ID in the new format.
     let mut values = vec![Scalar::Int64(row.0)];
@@ -287,6 +295,7 @@ pub fn encode_table(table: &Table) -> Result<EncodedObject> {
             table.name.clone(),
             to_thrift_schema(&table.schema)?,
             table.root.as_ref().map(to_ref).transpose()?,
+            table.max_row_id(),
         ),
     )
     .map(|bytes| EncodedObject::new(FormatTag::Table, bytes))
@@ -297,6 +306,7 @@ pub fn decode_table(bytes: &[u8]) -> Result<Table> {
         t.name,
         from_thrift_schema(t.schema)?,
         t.root.map(from_ref).transpose()?,
+        t.max_row_id,
     )
 }
 fn micros(time: SystemTime) -> Result<i64> {
@@ -304,8 +314,7 @@ fn micros(time: SystemTime) -> Result<i64> {
         Ok(d) => (false, d),
         Err(e) => (true, e.duration()),
     };
-    // Preserve the original codec's acceptance of SystemTime values, truncating
-    // to the stored precision rather than rejecting sub-microsecond inputs.
+    // Transactions store timestamps at microsecond precision.
     let n = i128::try_from(d.as_micros()).map_err(|_| beech_error!(Wire, "timestamp overflow"))?;
     i64::try_from(if negative { -n } else { n }).map_err(|_| beech_error!(Wire, "timestamp overflow"))
 }

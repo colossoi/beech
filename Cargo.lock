@@ -194,6 +194,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "beech-core",
+ "beech-disk",
  "beech-sqlite3",
  "beech-write",
  "clap",
@@ -204,7 +205,6 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "tempfile",
 ]
 
 [[package]]
@@ -214,22 +214,30 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "arrow-select",
+ "beech-disk",
  "beech-shaper",
  "bytes",
  "parquet",
  "sha2",
- "tempfile",
  "thiserror",
  "thrift",
+]
+
+[[package]]
+name = "beech-disk"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "beech-mem"
 version = "0.1.0"
 dependencies = [
+ "beech-disk",
  "indexmap",
  "libc",
- "tempfile",
 ]
 
 [[package]]
@@ -247,9 +255,9 @@ version = "0.1.0"
 dependencies = [
  "arrow-array",
  "beech-core",
+ "beech-disk",
  "bytes",
  "rusqlite",
- "tempfile",
 ]
 
 [[package]]
@@ -274,8 +282,8 @@ version = "0.1.0"
 dependencies = [
  "arrow-array",
  "beech-core",
+ "beech-disk",
  "beech-shaper",
- "tempfile",
 ]
 
 [[package]]
