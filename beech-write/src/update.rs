@@ -153,22 +153,12 @@ pub(crate) fn apply_ordered(
     let mut root = table.root().map(Reference::stored);
     for change in changes {
         tree.stats.operations += 1;
-        let (mut level, changed) = tree.edit(root.as_ref(), change?)?;
+        let (mut level, changed) = tree.edit(root.as_ref(), change?, true)?;
         if changed {
             while level.len() > 1 {
                 level = tree.branches(level, None)?;
             }
             root = level.pop();
-            // Collapse only at the root: non-root singleton branches preserve height.
-            while let Some(reference) = root.as_ref().filter(|r| r.height > 0) {
-                let mut children = tree.children(reference)?;
-                if children.len() != 1 {
-                    break;
-                }
-                tree.stats.root_collapses += 1;
-                tree.remove(reference)?;
-                root = children.pop();
-            }
         }
     }
     let root = root.as_ref().map(|r| tree.finalize(r, sink)).transpose()?;
@@ -264,7 +254,12 @@ impl<S: NodeSource> WorkingTree<'_, S> {
                 .collect(),
         }
     }
-    fn edit(&mut self, reference: Option<&Reference>, change: Change) -> Result<(Vec<Reference>, bool)> {
+    fn edit(
+        &mut self,
+        reference: Option<&Reference>,
+        change: Change,
+        is_root: bool,
+    ) -> Result<(Vec<Reference>, bool)> {
         if reference.is_none_or(|r| r.height == 0) {
             return self.edit_leaf(reference, change);
         }
@@ -278,11 +273,28 @@ impl<S: NodeSource> WorkingTree<'_, S> {
                 break;
             }
         }
-        let (replacement, changed) = self.edit(Some(&children[index]), change)?;
+        let (replacement, changed) = self.edit(Some(&children[index]), change, false)?;
         if !changed {
             return Ok((vec![reference.clone()], false));
         }
         children.splice(index..=index, replacement);
+        // The updated root's children are already in memory. Only read another
+        // node when a real collapse promotes it and may expose another singleton.
+        if is_root && children.len() == 1 {
+            self.remove(reference)?;
+            self.stats.root_collapses += 1;
+            let mut root = children.pop().unwrap();
+            while root.height > 0 {
+                let mut children = self.children(&root)?;
+                if children.len() != 1 {
+                    break;
+                }
+                self.remove(&root)?;
+                self.stats.root_collapses += 1;
+                root = children.pop().unwrap();
+            }
+            return Ok((vec![root], true));
+        }
         if children.is_empty() {
             self.remove(reference)?;
         }
@@ -462,6 +474,7 @@ mod tests {
                     row_id: 0,
                     record: key.clone(),
                 },
+                true,
             )
             .unwrap();
         let mut peak = fs::metadata(tree.path(0)).unwrap().len();
@@ -474,6 +487,7 @@ mod tests {
                         row_id: id,
                         record: key.clone(),
                     },
+                    true,
                 )
                 .unwrap();
             assert!(changed);
