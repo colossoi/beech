@@ -38,8 +38,9 @@ impl Workspace {
     pub fn path(&self) -> &Path {
         self.0.path()
     }
-    /// Stage a complete file under a single filename without replacing an
-    /// existing file. Neither file contents nor the scratch directory are synced.
+    /// Write directly to a private staged filename without replacing an existing
+    /// file. This is not atomic; the caller must not expose it during writing.
+    /// Neither file contents nor the scratch directory are synced.
     /// To publish durably, use `install_file` and sync the destination directory
     /// before publishing any pointer to it. Failure cleans up partial writes.
     pub fn stage_file(
@@ -56,10 +57,14 @@ impl Workspace {
                 "staged file requires a single filename",
             ));
         }
-        let mut file = self.file()?;
-        write(file.as_file_mut())?;
-        fs::hard_link(file.path(), self.path().join(name))?;
-        file.close()
+        let path = self.path().join(name);
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
+        let result = write(&mut file);
+        drop(file);
+        if result.is_err() {
+            fs::remove_file(path)?;
+        }
+        result
     }
     pub fn file(&self) -> io::Result<NamedTempFile> {
         NamedTempFile::new_in(self.path())
@@ -103,8 +108,10 @@ pub fn install_file(staged: &Path, destination: &Path) -> io::Result<()> {
 /// some objects may be installed; do not publish a root referencing this batch.
 ///
 /// On macOS, fsync each object to the device cache, then use one full sync of
-/// the destination directory to flush the batch to permanent storage. Other
-/// platforms retain the per-file durability sync. No object bytes are copied.
+/// the destination directory to flush the batch to permanent storage. Objects
+/// are moved with exclusive rename on macOS; other platforms retain hard links
+/// and per-file durability sync. No object bytes are copied. Cross-filesystem
+/// publication fails; there is no copy fallback.
 pub fn install_files(staging: &Path, destination: &Path) -> io::Result<()> {
     for entry in fs::read_dir(staging)? {
         let entry = entry?;
@@ -124,7 +131,7 @@ pub fn install_files(staging: &Path, destination: &Path) -> io::Result<()> {
                     return Err(error);
                 }
             }
-            fs::hard_link(entry.path(), &target)
+            rename_exclusive(&entry.path(), &target)
         };
         #[cfg(not(target_os = "macos"))]
         let result = install_file(&entry.path(), &target);
@@ -141,6 +148,20 @@ pub fn install_files(staging: &Path, destination: &Path) -> io::Result<()> {
     // On macOS sync_all uses F_FULLFSYNC: persist directory entries and flush
     // all preceding object writes on this filesystem before publishing a root.
     sync_directory(destination)
+}
+
+#[cfg(target_os = "macos")]
+fn rename_exclusive(from: &Path, to: &Path) -> io::Result<()> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let from = CString::new(from.as_os_str().as_bytes())?;
+    let to = CString::new(to.as_os_str().as_bytes())?;
+    // SAFETY: both paths are live NUL-terminated strings. RENAME_EXCL prevents
+    // replacement of an existing immutable object, including under a race.
+    if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 /// Atomically replace a pointer file after its referenced objects are installed.

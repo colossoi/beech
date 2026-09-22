@@ -300,7 +300,13 @@ fn staging_cleans_up_partial_writes_and_never_replaces_files() {
             .is_err()
     );
     assert_eq!(fs::read_dir(workspace.path()).unwrap().count(), 0);
-    workspace.stage_file("object", |file| file.write_all(b"complete")).unwrap();
+    workspace
+        .stage_file("object", |file| {
+            assert!(workspace.path().join("object").is_file());
+            assert_eq!(fs::read_dir(workspace.path())?.count(), 1);
+            file.write_all(b"complete")
+        })
+        .unwrap();
     assert_eq!(
         workspace.stage_file("object", |file| file.write_all(b"replacement")).unwrap_err().kind(),
         io::ErrorKind::AlreadyExists
@@ -317,23 +323,24 @@ fn staging_cleans_up_partial_writes_and_never_replaces_files() {
 
 #[cfg(unix)]
 #[test]
-fn batch_install_links_objects_and_reuses_existing_files() {
+fn batch_install_preserves_objects_and_reuses_existing_files() {
     use std::os::unix::fs::MetadataExt;
     let destination = Workspace::new().unwrap();
     let staging = Workspace::in_directory(destination.path()).unwrap();
     staging.stage_file("one", |file| file.write_all(b"first")).unwrap();
     staging.stage_file("two", |file| file.write_all(b"second")).unwrap();
     fs::hard_link(staging.path().join("one"), destination.path().join("one")).unwrap();
+    let before = ["one", "two"].map(|name| fs::metadata(staging.path().join(name)).unwrap().ino());
     install_files(staging.path(), destination.path()).unwrap();
-    for name in ["one", "two"] {
-        let source = staging.path().join(name);
-        let target = destination.path().join(name);
-        assert_eq!(fs::read(&source).unwrap(), fs::read(&target).unwrap());
+    for (i, name) in ["one", "two"].into_iter().enumerate() {
         assert_eq!(
-            fs::metadata(source).unwrap().ino(),
-            fs::metadata(target).unwrap().ino()
+            fs::metadata(destination.path().join(name)).unwrap().ino(),
+            before[i]
         );
     }
+    assert_eq!(fs::read(destination.path().join("one")).unwrap(), b"first");
+    #[cfg(target_os = "macos")]
+    assert!(!staging.path().join("two").exists());
     staging.close().unwrap();
     assert_eq!(fs::read(destination.path().join("two")).unwrap(), b"second");
 }
@@ -347,4 +354,24 @@ fn batch_install_rejects_a_directory_at_an_object_path() {
     fs::create_dir(destination.path().join("object")).unwrap();
     assert!(install_files(staging.path(), destination.path()).is_err());
     assert!(destination.path().join("object").is_dir());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn exclusive_rename_never_replaces_existing_files() {
+    let workspace = Workspace::new().unwrap();
+    let from = workspace.path().join("source");
+    let to = workspace.path().join("destination");
+    fs::write(&from, b"new").unwrap();
+    fs::write(&to, b"old").unwrap();
+    assert_eq!(
+        rename_exclusive(&from, &to).unwrap_err().kind(),
+        io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(fs::read(&from).unwrap(), b"new");
+    assert_eq!(fs::read(&to).unwrap(), b"old");
+    fs::remove_file(&to).unwrap();
+    rename_exclusive(&from, &to).unwrap();
+    assert_eq!(fs::read(&to).unwrap(), b"new");
+    assert!(!from.exists());
 }

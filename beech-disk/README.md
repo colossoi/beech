@@ -56,7 +56,8 @@ Run `cargo test -p beech-disk --locked`.
 
 `install_files` publishes a directory of staged immutable objects. On macOS it
 uses plain `fsync` per object and one full directory sync to flush the batch;
-other platforms keep per-file durability syncs. Publish the root only after
+It uses exclusive rename to move staged files into place on macOS; other
+platforms keep hard links and per-file durability syncs. Publish the root only after
 this function succeeds. Existing regular destination files are trusted by name.
 
 `PageStore` caches mutable scratch pages within a configurable decoded-value
@@ -65,3 +66,8 @@ dirty LRU evictions and decode reloads. Writes are made without syncing; clean e
 zero-byte budget bypass the cache. Errors poison the store. Caller-supplied
 memory accounting determines resident weights. Cache metadata and active caller/codec buffers are outside the byte budget. Use one store per
 workspace `node-*` namespace; it does not cache arbitrary workspace files.
+
+Staging writes directly to its private filename with `create_new`, without an
+intermediate temporary name or hard link. Write failure removes the partial file.
+Installation into the repository happens only at publication. Cross-filesystem
+installation fails without copying.

@@ -74,10 +74,12 @@ process exit; the `.beech-write.lock` file remains in the directory.
 Objects are staged in a private temporary directory on the same filesystem.
 Staging writes and closes objects without any file or directory syncs. Commit
 walks the staging directory (no in-memory ID set), syncs each completed object’s
-contents, links files into place without overwriting existing objects,
+contents, installs files without overwriting existing objects,
 and atomically replaces the text `root` pointer last. On macOS, object contents
 use plain `fsync`, followed by one full flush of the destination directory for
-the batch. Root-pointer publication retains its separate durability syncs. Existing objects are reused
+the batch, with exclusive rename moving the files into their final locations.
+Other platforms use hard links. Root-pointer publication retains its separate
+durability syncs. Existing objects are reused
 by ID using metadata checks, without reading or comparing their contents. The
 writer trusts codec-produced IDs; integrity verification belongs to the reader
 or an explicit integrity check. Objects use bare 64-digit
