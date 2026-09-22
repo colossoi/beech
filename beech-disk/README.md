@@ -53,3 +53,15 @@ replacement is an ambiguous commit; inspect the pointer to determine its state.
 Scratch spools are not a crash-recovery log and are not synced per record.
 
 Run `cargo test -p beech-disk --locked`.
+
+`install_files` publishes a directory of staged immutable objects. On macOS it
+uses plain `fsync` per object and one full directory sync to flush the batch;
+other platforms keep per-file durability syncs. Publish the root only after
+this function succeeds. Existing regular destination files are trusted by name.
+
+`PageStore` caches mutable scratch pages within a configurable decoded-value
+budget, using the shared `beech-mem::lru::Lru`. Caller-supplied codecs encode
+dirty LRU evictions and decode reloads. Writes are made without syncing; clean evictions do not rewrite disk. Oversized pages and a
+zero-byte budget bypass the cache. Errors poison the store. Caller-supplied
+memory accounting determines resident weights. Cache metadata and active caller/codec buffers are outside the byte budget. Use one store per
+workspace `node-*` namespace; it does not cache arbitrary workspace files.

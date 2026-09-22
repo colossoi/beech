@@ -1,6 +1,8 @@
 //! Portable transaction scratch space, atomic publication, and external sorting.
 mod merge;
+mod pages;
 pub use merge::IterMerger;
+pub use pages::{PageStats, PageStore};
 mod records;
 mod sort;
 pub use records::Spool;
@@ -93,6 +95,52 @@ pub fn install_file(staged: &Path, destination: &Path) -> io::Result<()> {
     let file = fs::OpenOptions::new().read(true).write(true).open(staged)?;
     sync_for_publication(&file, staged)?;
     fs::hard_link(staged, destination)
+}
+
+/// Install a directory of staged immutable objects, then durably sync the
+/// destination directory. Both directories must be on the same filesystem.
+/// Existing regular files are trusted to contain the same object. On failure,
+/// some objects may be installed; do not publish a root referencing this batch.
+///
+/// On macOS, fsync each object to the device cache, then use one full sync of
+/// the destination directory to flush the batch to permanent storage. Other
+/// platforms retain the per-file durability sync. No object bytes are copied.
+pub fn install_files(staging: &Path, destination: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(staging)? {
+        let entry = entry?;
+        let target = destination.join(entry.file_name());
+        #[cfg(target_os = "macos")]
+        let result = {
+            use std::os::fd::AsRawFd;
+            let file = File::open(entry.path())?;
+            // SAFETY: file owns a live descriptor for the duration of fsync.
+            // Unlike Rust's sync_all on macOS, this does not issue F_FULLFSYNC.
+            loop {
+                if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+                    break;
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+            fs::hard_link(entry.path(), &target)
+        };
+        #[cfg(not(target_os = "macos"))]
+        let result = install_file(&entry.path(), &target);
+        match result {
+            Ok(()) => (),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if !fs::metadata(&target)?.is_file() {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    // On macOS sync_all uses F_FULLFSYNC: persist directory entries and flush
+    // all preceding object writes on this filesystem before publishing a root.
+    sync_directory(destination)
 }
 
 /// Atomically replace a pointer file after its referenced objects are installed.

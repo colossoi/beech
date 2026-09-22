@@ -314,3 +314,37 @@ fn staging_cleans_up_partial_writes_and_never_replaces_files() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn batch_install_links_objects_and_reuses_existing_files() {
+    use std::os::unix::fs::MetadataExt;
+    let destination = Workspace::new().unwrap();
+    let staging = Workspace::in_directory(destination.path()).unwrap();
+    staging.stage_file("one", |file| file.write_all(b"first")).unwrap();
+    staging.stage_file("two", |file| file.write_all(b"second")).unwrap();
+    fs::hard_link(staging.path().join("one"), destination.path().join("one")).unwrap();
+    install_files(staging.path(), destination.path()).unwrap();
+    for name in ["one", "two"] {
+        let source = staging.path().join(name);
+        let target = destination.path().join(name);
+        assert_eq!(fs::read(&source).unwrap(), fs::read(&target).unwrap());
+        assert_eq!(
+            fs::metadata(source).unwrap().ino(),
+            fs::metadata(target).unwrap().ino()
+        );
+    }
+    staging.close().unwrap();
+    assert_eq!(fs::read(destination.path().join("two")).unwrap(), b"second");
+}
+
+#[cfg(unix)]
+#[test]
+fn batch_install_rejects_a_directory_at_an_object_path() {
+    let destination = Workspace::new().unwrap();
+    let staging = Workspace::in_directory(destination.path()).unwrap();
+    staging.stage_file("object", |file| file.write_all(b"data")).unwrap();
+    fs::create_dir(destination.path().join("object")).unwrap();
+    assert!(install_files(staging.path(), destination.path()).is_err());
+    assert!(destination.path().join("object").is_dir());
+}

@@ -14,6 +14,15 @@ fn record(key: i64, value: String) -> Vec<Scalar> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = std::env::args().skip(1);
+    let cache_bytes = match args.next().as_deref() {
+        None => 8 * 1024 * 1024,
+        Some("--cache-bytes") => args.next().ok_or("missing cache byte limit")?.parse()?,
+        _ => return Err("usage: random_edits [--cache-bytes BYTES]".into()),
+    };
+    if args.next().is_some() {
+        return Err("unexpected argument".into());
+    }
     let directory = Workspace::new()?;
     let repository = Arc::new(Repository::new(FileStore::new(directory.path())));
     let schema = TableSchema::new(
@@ -46,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let initial_rows =
         RowCursor::new(&old_snapshot, &table, vec![])?.collect::<beech_core::Result<Vec<_>>>()?;
     let root_before = fs::read(directory.path().join("root"))?;
-    let mut tx = Transaction::new(schema, SortLimits::default())?;
+    let mut tx = Transaction::new(schema, SortLimits::default())?.with_page_cache_bytes(cache_bytes);
     // Fixed-seed xorshift64 makes the workload reproducible without a dependency.
     let mut seed = 0x4bee_c123_9876_abcd_u64;
     let mut random = || {
@@ -126,7 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         total_elapsed.as_secs_f64()
     );
     println!(
-        "Visits: {} leaves, {} branches; scratch writes: {} leaves, {} branches",
+        "Visits: {} leaves, {} branches; page rewrites: {} leaves, {} branches",
         stats.leaf_visits, stats.branch_visits, stats.leaf_writes, stats.branch_writes
     );
     println!(
@@ -136,6 +145,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "Peak scratch: {} bytes; scratch written: {} bytes; final height: {:?}",
         stats.peak_scratch_bytes, stats.scratch_bytes_written, stats.final_height
+    );
+    println!(
+        "Page cache: limit {cache_bytes} bytes, peak {} bytes, {} hits, {} misses, {} evictions",
+        stats.peak_page_cache_bytes, stats.page_cache_hits, stats.page_cache_misses, stats.page_evictions
     );
     println!("Verified all rows, unchanged publication before commit, and old snapshot after commit.");
     Ok(())

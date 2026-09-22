@@ -6,8 +6,7 @@ use beech_core::{
 use beech_disk::{ExternalSort, SortLimits, SortedRuns, Spool, Workspace};
 use std::{
     cmp::Ordering,
-    fs::File,
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{self, BufRead, Read, Write},
 };
 
 type ChangeOrder = fn(&Change, &Change) -> Ordering;
@@ -21,6 +20,7 @@ pub struct Transaction {
     scratch: Option<(Spool, Workspace)>,
     sort_limits: SortLimits,
     max_row_id: Option<i64>,
+    page_cache_bytes: usize,
 }
 impl Transaction {
     /// Sort limits apply to bulk creation only.
@@ -31,7 +31,14 @@ impl Transaction {
             schema,
             sort_limits,
             max_row_id: None,
+            page_cache_bytes: 8 * 1024 * 1024,
         })
+    }
+    /// Set the mutable-page cache byte limit (default 8 MiB). Zero forces
+    /// disk-only updates. Does not affect the input spool or bulk creation.
+    pub fn with_page_cache_bytes(mut self, bytes: usize) -> Self {
+        self.page_cache_bytes = bytes;
+        self
     }
     pub fn push(&mut self, change: Change) -> Result<()> {
         let result = self.push_inner(change);
@@ -118,7 +125,7 @@ impl Transaction {
         let input_bytes = reader.get_ref().metadata()?.len();
         crate::update::apply_ordered(
             records(reader, Change::read),
-            &workspace,
+            crate::update::WorkingNode::pages(&workspace, self.page_cache_bytes),
             &updated,
             input_bytes,
             source,
@@ -313,7 +320,7 @@ pub(crate) fn read_frame(reader: &mut dyn BufRead) -> io::Result<Option<Vec<u8>>
     Ok(Some(bytes))
 }
 pub(crate) fn records<T>(
-    mut reader: BufReader<File>,
+    mut reader: impl BufRead,
     decode: fn(&mut dyn BufRead) -> io::Result<Option<T>>,
 ) -> impl Iterator<Item = io::Result<T>> {
     let mut ended = false;
@@ -346,7 +353,7 @@ mod framing_tests {
         for value in [b"abc".as_slice(), b"", b"defg"] {
             write_frame(&mut bytes, value).unwrap();
         }
-        let mut reader = BufReader::with_capacity(2, Cursor::new(bytes));
+        let mut reader = std::io::BufReader::with_capacity(2, Cursor::new(bytes));
         for value in [b"abc".as_slice(), b"", b"defg"] {
             assert_eq!(read_frame(&mut reader).unwrap().as_deref(), Some(value));
         }
@@ -411,7 +418,7 @@ mod failure_tests {
     }
     #[test]
     fn workspace_write_failure_aborts_before_staging_and_cleans_up() {
-        let mut tx = Transaction::new(schema(), SortLimits::default()).unwrap();
+        let mut tx = Transaction::new(schema(), SortLimits::default()).unwrap().with_page_cache_bytes(0);
         tx.push(insert(1)).unwrap();
         let path = tx.scratch.as_ref().unwrap().1.path().to_path_buf();
         // Force the first mutable node write to fail, without relying on permissions.

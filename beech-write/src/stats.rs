@@ -10,7 +10,7 @@ pub struct TransactionStats {
     pub no_op_updates: u64,
     pub leaf_visits: u64,
     pub branch_visits: u64,
-    /// Complete temporary node writes, including repeated rewrites.
+    /// Complete page replacements, including cached rewrites.
     pub leaf_writes: u64,
     pub branch_writes: u64,
     /// Additional nodes produced by local shaping, excluding new root levels.
@@ -27,8 +27,13 @@ pub struct TransactionStats {
     /// nodes. Excludes filesystem allocation overhead, repository objects, and
     /// the publication staging directory. Measured incrementally, without scans.
     pub peak_scratch_bytes: u64,
-    /// Cumulative temporary node bytes written, counting repeated versions.
+    /// Cumulative page bytes spilled to disk, counting repeated versions.
     pub scratch_bytes_written: u64,
+    /// Peak estimated decoded page bytes; excludes active copies and cache metadata.
+    pub peak_page_cache_bytes: usize,
+    pub page_cache_hits: u64,
+    pub page_cache_misses: u64,
+    pub page_evictions: u64,
     /// Root height; None for an empty tree and Some(0) for a single leaf.
     pub final_height: Option<u32>,
     /// Apply and finalization time; excludes input spooling and publication.

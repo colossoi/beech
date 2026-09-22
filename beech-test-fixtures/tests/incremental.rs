@@ -257,7 +257,9 @@ fn ordered_repeated_keys_stage_only_the_final_leaf() {
     assert_eq!(stats.leaves_staged, 1);
     assert_eq!(stats.branches_staged, 0);
     assert_eq!(stats.final_height, Some(0));
-    assert!(stats.peak_scratch_bytes > stats.input_bytes);
+    assert_eq!(stats.peak_scratch_bytes, stats.input_bytes);
+    assert!(stats.peak_page_cache_bytes > 0);
+    assert_eq!(stats.scratch_bytes_written, 0);
     assert!(stats.staged_bytes > 0);
 
     assert_eq!(updated.max_row_id(), 100);
@@ -298,4 +300,44 @@ fn ordered_edits_grow_collapse_empty_and_restart_the_tree() {
     assert_eq!(writer.num_to_commit(), 1);
     writer.commit().unwrap();
     assert_eq!(read(&source, &updated), vec![(0, row(-1, 7).1)]);
+}
+
+#[test]
+fn page_cache_limits_preserve_the_same_tree() {
+    use beech_write::{SortLimits, Transaction};
+    let (store, source, table) =
+        build_simple_table("t", (0..50).map(|k| row(k, 0)).collect(), schema(), 256, 64).unwrap();
+    let mut expected_root = None;
+    for limit in [0, 128, 8 * 1024 * 1024] {
+        let mut tx =
+            Transaction::new(schema(), SortLimits::default()).unwrap().with_page_cache_bytes(limit);
+        for step in 0..200 {
+            let key = step % 50;
+            tx.push(Change::Update {
+                key: vec![Scalar::Int32(key)],
+                row_id: key as i64,
+                record: row(key, step).1,
+            })
+            .unwrap();
+        }
+        let mut writer = store.writer();
+        let (updated, stats) =
+            tx.apply_with_stats(&table, &source, &mut writer, BuildOptions::new(256, 64).unwrap()).unwrap();
+        writer.commit().unwrap();
+        assert_eq!(
+            read(&source, &updated),
+            (0..50).map(|k| row(k, 150 + k)).collect::<Vec<_>>()
+        );
+        let root = updated.root().unwrap().id();
+        if let Some(expected) = expected_root {
+            assert_eq!(root, expected);
+        }
+        expected_root = Some(root);
+        assert!(stats.peak_page_cache_bytes <= limit);
+        if limit == 8 * 1024 * 1024 {
+            assert_eq!(stats.scratch_bytes_written, 0);
+        } else {
+            assert!(stats.scratch_bytes_written > 0);
+        }
+    }
 }

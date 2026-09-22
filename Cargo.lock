@@ -227,6 +227,8 @@ dependencies = [
 name = "beech-disk"
 version = "0.1.0"
 dependencies = [
+ "beech-mem",
+ "libc",
  "tempfile",
  "windows-sys 0.61.2",
 ]
@@ -236,7 +238,6 @@ name = "beech-mem"
 version = "0.1.0"
 dependencies = [
  "beech-disk",
- "indexmap",
  "libc",
 ]
 
@@ -495,12 +496,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "equivalent"
-version = "1.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
-
-[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -697,16 +692,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f31827a206f56af32e590ba56d5d2d085f558508192593743f16b2306495269f"
 dependencies = [
  "cc",
-]
-
-[[package]]
-name = "indexmap"
-version = "2.14.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
-dependencies = [
- "equivalent",
- "hashbrown 0.17.1",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 use crate::{ObjectSink, Writer};
 use beech_core::Id;
-use beech_disk::{atomic_replace, sync_directory, Workspace};
+use beech_disk::{atomic_replace, Workspace};
 use std::{
     fs::{self, File},
     io::{self, Write},
@@ -23,7 +23,7 @@ impl FileWriter {
         let directory = directory.as_ref().to_path_buf();
         fs::create_dir_all(&directory)?;
         #[cfg(not(unix))]
-        sync_directory(&directory)?;
+        beech_disk::sync_directory(&directory)?;
         let lock = beech_disk::lock(&directory.join(".beech-write.lock"))?;
         let staging = Workspace::in_directory(&directory)?;
         Ok(Self {
@@ -60,19 +60,7 @@ impl Writer for FileWriter {
         Ok(())
     }
     fn commit(self) -> io::Result<()> {
-        // Sync and install completed objects only at publication time.
-        // The directory is the object journal; no growing ID set.
-        for entry in fs::read_dir(self.staging.path())? {
-            let entry = entry?;
-            let destination = self.directory.join(entry.file_name());
-            match beech_disk::install_file(&entry.path(), &destination) {
-                Ok(()) => (),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && object_file_exists(&destination)? => {
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        sync_directory(&self.directory)?;
+        beech_disk::install_files(self.staging.path(), &self.directory)?;
         if let Some(root) = self.root {
             atomic_replace(&self.directory.join("root"), root.to_string().as_bytes())?;
         }

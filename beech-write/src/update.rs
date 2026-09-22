@@ -12,11 +12,10 @@ use beech_core::{
     query::RowCursor,
     BeechError, Id, InternalNode, Key, KeyOrdering, NodeRef, NodeSource, Result, Row, Scalar, Table,
 };
-use beech_disk::{SortLimits, Workspace};
+use beech_disk::{PageStore, SortLimits};
 use std::{
     cmp::Ordering,
-    fs::{self, File},
-    io::{self, BufRead, BufReader, BufWriter, Write},
+    io::{self, BufRead, Write},
 };
 
 #[derive(Debug, Clone)]
@@ -67,7 +66,7 @@ enum Location {
     Working(u64),
 }
 #[derive(Clone)]
-struct Reference {
+pub(crate) struct Reference {
     location: Location,
     height: u32,
     count: u64,
@@ -127,9 +126,74 @@ impl Reference {
     }
 }
 
+// Private decoded working nodes. The scratch codec runs only when a page spills.
+pub(crate) enum WorkingNode {
+    Leaf(Vec<Row>),
+    Branch(Vec<Reference>),
+}
+impl WorkingNode {
+    pub(crate) fn pages(workspace: &beech_disk::Workspace, limit: usize) -> PageStore<Self> {
+        PageStore::new(workspace, limit, Self::write, Self::read, Self::memory_size)
+    }
+    fn write(&self, writer: &mut dyn Write) -> io::Result<()> {
+        match self {
+            Self::Leaf(rows) => {
+                writer.write_all(&[0])?;
+                for row in rows {
+                    RowRecord(row.clone()).write(writer)?;
+                }
+            }
+            Self::Branch(children) => {
+                writer.write_all(&[1])?;
+                for child in children {
+                    child.write(writer)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    fn read(reader: &mut dyn BufRead) -> io::Result<Self> {
+        let mut tag = [0];
+        reader.read_exact(&mut tag)?;
+        match tag[0] {
+            0 => Ok(Self::Leaf(
+                records(reader, RowRecord::read).map(|r| r.map(|r| r.0)).collect::<io::Result<_>>()?,
+            )),
+            1 => Ok(Self::Branch(
+                records(reader, Reference::read).collect::<io::Result<_>>()?,
+            )),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "invalid working node")),
+        }
+    }
+    fn memory_size(&self) -> usize {
+        fn values(values: &Vec<Scalar>) -> usize {
+            values.capacity() * std::mem::size_of::<Scalar>()
+                + values
+                    .iter()
+                    .map(|v| match v {
+                        Scalar::Utf8(s) => s.capacity(),
+                        Scalar::Binary(b) => b.capacity(),
+                        _ => 0,
+                    })
+                    .sum::<usize>()
+        }
+        std::mem::size_of::<Self>()
+            + match self {
+                Self::Leaf(rows) => {
+                    rows.capacity() * std::mem::size_of::<Row>()
+                        + rows.iter().map(|r| values(&r.1)).sum::<usize>()
+                }
+                Self::Branch(children) => {
+                    children.capacity() * std::mem::size_of::<Reference>()
+                        + children.iter().map(|r| values(&r.key)).sum::<usize>()
+                }
+            }
+    }
+}
+
 pub(crate) fn apply_ordered(
     changes: impl Iterator<Item = io::Result<Change>>,
-    workspace: &Workspace,
+    pages: PageStore<WorkingNode>,
     table: &Table,
     input_bytes: u64,
     source: &impl NodeSource,
@@ -138,12 +202,11 @@ pub(crate) fn apply_ordered(
 ) -> Result<(Table, TransactionStats)> {
     let started = std::time::Instant::now();
     let mut tree = WorkingTree {
-        workspace,
+        pages,
         table,
         source,
         options,
         next_id: 0,
-        scratch_bytes: input_bytes,
         stats: TransactionStats {
             input_bytes,
             peak_scratch_bytes: input_bytes,
@@ -162,48 +225,35 @@ pub(crate) fn apply_ordered(
         }
     }
     let root = root.as_ref().map(|r| tree.finalize(r, sink)).transpose()?;
+    let pages = tree.pages.stats();
+    tree.stats.peak_scratch_bytes = input_bytes + pages.peak_disk_bytes;
+    tree.stats.scratch_bytes_written = pages.bytes_written;
+    tree.stats.peak_page_cache_bytes = pages.peak_resident_bytes;
+    tree.stats.page_cache_hits = pages.hits;
+    tree.stats.page_cache_misses = pages.misses;
+    tree.stats.page_evictions = pages.evictions;
     tree.stats.final_height = root.as_ref().map(NodeRef::height);
     tree.stats.elapsed = started.elapsed();
     Ok((table.with_root(root)?, tree.stats))
 }
 
 struct WorkingTree<'a, S> {
-    workspace: &'a Workspace,
+    pages: PageStore<WorkingNode>,
     table: &'a Table,
     source: &'a S,
     options: BuildOptions,
     next_id: u64,
-    scratch_bytes: u64,
     stats: TransactionStats,
 }
 impl<S: NodeSource> WorkingTree<'_, S> {
-    fn path(&self, id: u64) -> std::path::PathBuf {
-        self.workspace.path().join(format!("node-{id}"))
-    }
     fn remove(&mut self, reference: &Reference) -> Result<()> {
         if let Location::Working(id) = reference.location {
-            let bytes = fs::metadata(self.path(id))?.len();
-            fs::remove_file(self.path(id))?;
-            self.scratch_bytes -= bytes;
+            self.pages.remove(id)?;
         }
         Ok(())
     }
-    fn writer(&mut self, id: u64) -> Result<BufWriter<File>> {
-        let old = match fs::metadata(self.path(id)) {
-            Ok(metadata) => metadata.len(),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
-            Err(error) => return Err(error.into()),
-        };
-        let file = File::create(self.path(id))?;
-        self.scratch_bytes -= old;
-        Ok(BufWriter::new(file))
-    }
-    fn finish_write(&mut self, mut writer: BufWriter<File>, leaf: bool) -> Result<()> {
-        writer.flush()?;
-        let bytes = writer.get_ref().metadata()?.len();
-        self.scratch_bytes += bytes;
-        self.stats.peak_scratch_bytes = self.stats.peak_scratch_bytes.max(self.scratch_bytes);
-        self.stats.scratch_bytes_written += bytes;
+    fn write_node(&mut self, id: u64, node: WorkingNode, leaf: bool) -> Result<()> {
+        self.pages.write(id, node)?;
         if leaf {
             self.stats.leaf_writes += 1;
         } else {
@@ -226,7 +276,7 @@ impl<S: NodeSource> WorkingTree<'_, S> {
             id.checked_add(1).ok_or_else(|| BeechError::InvalidNode("temporary ID overflow".into()))?;
         Ok(id)
     }
-    fn rows(&self, reference: Option<&Reference>) -> Result<Vec<Row>> {
+    fn rows(&mut self, reference: Option<&Reference>) -> Result<Vec<Row>> {
         let Some(reference) = reference else {
             return Ok(vec![]);
         };
@@ -235,12 +285,16 @@ impl<S: NodeSource> WorkingTree<'_, S> {
                 let table = self.table.with_root(Some(reference.node(self.table)?))?;
                 RowCursor::new(self.source, &table, vec![])?.collect()
             }
-            Location::Working(id) => records(BufReader::new(File::open(self.path(id))?), RowRecord::read)
-                .map(|r| Ok(r?.0))
-                .collect(),
+            Location::Working(id) => Ok(self.pages.read(id, |node| match node {
+                WorkingNode::Leaf(rows) => Ok(rows.clone()),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "expected working leaf",
+                )),
+            })?),
         }
     }
-    fn children(&self, reference: &Reference) -> Result<Vec<Reference>> {
+    fn children(&mut self, reference: &Reference) -> Result<Vec<Reference>> {
         match reference.location {
             Location::Stored(_) => Ok(self
                 .source
@@ -249,9 +303,13 @@ impl<S: NodeSource> WorkingTree<'_, S> {
                 .iter()
                 .map(Reference::stored)
                 .collect()),
-            Location::Working(id) => records(BufReader::new(File::open(self.path(id))?), Reference::read)
-                .map(|r| Ok(r?))
-                .collect(),
+            Location::Working(id) => Ok(self.pages.read(id, |node| match node {
+                WorkingNode::Branch(children) => Ok(children.clone()),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "expected working branch",
+                )),
+            })?),
         }
     }
     fn edit(
@@ -360,11 +418,7 @@ impl<S: NodeSource> WorkingTree<'_, S> {
                 let key = self.table.schema().key_from_row(rows.last().unwrap())?;
                 let count = rows.len() as u64;
                 let id = self.allocate(&mut reuse)?;
-                let mut writer = self.writer(id)?;
-                for row in rows {
-                    RowRecord(row).write(&mut writer)?;
-                }
-                self.finish_write(writer, true)?;
+                self.write_node(id, WorkingNode::Leaf(rows), true)?;
                 output.push(Reference {
                     location: Location::Working(id),
                     height: 0,
@@ -395,11 +449,7 @@ impl<S: NodeSource> WorkingTree<'_, S> {
                     .ok_or_else(|| BeechError::InvalidNode("row count overflow".into()))?;
                 let key = children.last().unwrap().key.clone();
                 let id = self.allocate(&mut reuse)?;
-                let mut writer = self.writer(id)?;
-                for child in children {
-                    child.write(&mut writer)?;
-                }
-                self.finish_write(writer, false)?;
+                self.write_node(id, WorkingNode::Branch(children), false)?;
                 output.push(Reference {
                     location: Location::Working(id),
                     height,
@@ -449,20 +499,20 @@ mod tests {
         storage::{FileStore, Repository},
         DataType, Field, TableSchema,
     };
+    use beech_disk::Workspace;
 
     #[test]
-    fn repeated_edits_reuse_the_same_flushed_working_file() {
+    fn repeated_edits_reuse_the_same_cached_page() {
         let workspace = Workspace::new().unwrap();
         let schema = TableSchema::new(vec![Field::new("k", DataType::Int64, false)], vec![0]).unwrap();
         let table = Table::new("t", schema, None, 100).unwrap();
         let source = Repository::new(FileStore::new(workspace.path()));
         let mut tree = WorkingTree {
-            workspace: &workspace,
+            pages: WorkingNode::pages(&workspace, 4096),
             table: &table,
             source: &source,
             options: BuildOptions::new(100_000, 1).unwrap(),
             next_id: 0,
-            scratch_bytes: 0,
             stats: TransactionStats::default(),
         };
         let key = vec![Scalar::Int64(1)];
@@ -477,7 +527,6 @@ mod tests {
                 true,
             )
             .unwrap();
-        let mut peak = fs::metadata(tree.path(0)).unwrap().len();
         for id in 1..100 {
             let (next, changed) = tree
                 .edit(
@@ -495,16 +544,12 @@ mod tests {
             assert_eq!(tree.rows(Some(&nodes[0])).unwrap(), vec![(id, key.clone())]);
             assert_eq!(tree.stats.leaf_writes, id as u64 + 1);
             assert_eq!(tree.stats.leaf_visits, id as u64);
-            let bytes = fs::metadata(tree.path(0)).unwrap().len();
-            assert_eq!(tree.scratch_bytes, bytes);
-            peak = peak.max(bytes);
-            assert_eq!(tree.stats.peak_scratch_bytes, peak);
-            assert!(tree.stats.scratch_bytes_written > bytes);
+            assert_eq!(tree.pages.stats().bytes_written, 0);
+            assert!(tree.pages.stats().resident_bytes <= 4096);
             assert_eq!(tree.next_id, 1);
-            assert_eq!(fs::read_dir(workspace.path()).unwrap().count(), 1);
+            assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
         }
         tree.remove(&nodes[0]).unwrap();
-        assert_eq!(tree.scratch_bytes, 0);
-        assert_eq!(tree.stats.peak_scratch_bytes, peak);
+        assert_eq!(tree.pages.stats().resident_bytes, 0);
     }
 }
