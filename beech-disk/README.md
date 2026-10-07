@@ -26,12 +26,21 @@ Filesystem tools independent of Beech's table and object formats:
   supplies separate writing, decoding (`BufRead`), memory-accounting, and
   ordering functions. There is no serialization trait or required framing.
 
-`SortLimits` defaults to an 8 MiB chunk budget and a merge fan-in of 32. Completed
+`SortLimits` defaults to 4 chunk workers, an 8 MiB per-chunk budget and a merge
+fan-in of 32. `with_workers(1)` selects inline serial processing. Completed
 runs are closed. Cascading merges retain only O(fan-in × log(chunks)) scratch-file
 names, and each merge opens at most fan-in input files plus one output. Equal
 records are retained; their relative order is unspecified. `finish` returns
 `SortedRuns`; its `reader` streams the final heap merge without writing a final
 output file. Readers can be reopened for a validation pass before processing.
+
+Chunk sorting and run encoding/writing execute independently in the shared
+`WorkerPool` task scheduler. Completed runs are collected in submission order;
+cascading merges and the final lazy merge remain sequential. At most `workers`
+submitted chunks and one producer chunk are retained, so the default chunk-record
+bound is 40 MiB, plus merge heads; individual oversized records may exceed this. Run receivers are also
+bounded by the worker count. Records must be `Send`; comparators must be
+`Send + Sync + 'static` because workers own their jobs.
 
 The budget covers the accounted records in a sort chunk, not the process's total
 RSS. A single larger record is allowed. Merging retains one decoded head per
@@ -60,14 +69,48 @@ It uses exclusive rename to move staged files into place on macOS; other
 platforms keep hard links and per-file durability syncs. Publish the root only after
 this function succeeds. Existing regular destination files are trusted by name.
 
-`PageStore` caches mutable scratch pages within a configurable decoded-value
-budget, using the shared `beech-mem::lru::Lru`. Caller-supplied codecs encode
-dirty LRU evictions and decode reloads. Writes are made without syncing; clean evictions do not rewrite disk. Oversized pages and a
-zero-byte budget bypass the cache. Errors poison the store. Caller-supplied
-memory accounting determines resident weights. Cache metadata and active caller/codec buffers are outside the byte budget. Use one store per
-workspace `node-*` namespace; it does not cache arbitrary workspace files.
+`PageStore` stores encoded mutable scratch pages in a disposable, single-process
+redb database. `ScratchStore` exposes provider-neutral byte-key `get`, `put`, and
+`delete` operations with immediate read-your-writes; `PageStore::with_store`
+accepts alternative providers. `PageStore::with_cache` enables a byte-budgeted
+decoded LRU using a caller-supplied allocation-size function. Dirty eviction or
+explicit `flush` encodes the latest value; clean eviction skips writes. Cache
+hits skip codecs and KV reads, and oversized values bypass retention. Without
+cache configuration every write encodes and every read decodes. Each provider
+mutation commits a non-durable redb transaction. Its private file backend suppresses sync requests
+also during database creation and shutdown; this scratch data is not a recovery log.
+
+Each store owns a unique temporary database file and retains its workspace.
+Drop discards dirty decoded values without flushing, closes the database, and
+removes its file before releasing the workspace.
+Operation errors poison the typed page store. Page statistics count live/peak
+encoded payload bytes and cumulative encoded writes, not database file size,
+physical I/O, provider cache memory, or codec buffers. Separate counters report
+decoded retained bytes, peak bytes, hits, misses and dirty evictions; the decoded
+budget excludes LRU bookkeeping and transient clones. Final immutable objects
+and filesystem publication do not use this database.
 
 Staging writes directly to its private filename with `create_new`, without an
 intermediate temporary name or hard link. Write failure removes the partial file.
 Installation into the repository happens only at publication. Cross-filesystem
 installation fails without copying.
+
+`FileOutput` is a streaming queue for completed private immutable files. Submission
+may block for capacity; `finish` waits until accepted files have been written and
+closed, returning deferred errors. Neither submission nor completion syncs files.
+The default `ThreadPoolFileOutput` uses four workers, at most twenty queued plus
+active files, and eight MiB of queued plus active payloads. A single oversized
+file is admitted only with an empty queue. Payloads are copied after capacity is
+available; caller-owned buffers and filename metadata are outside the byte limit.
+Pending names are deduplicated; completed names are checked on disk so there is
+no growing in-memory set of every object ID. Output errors remain sticky. Drop
+joins workers before releasing the workspace. This boundary supports future
+platform-specific output providers without changing encoders or publication.
+
+`WorkerPool` is a reusable bounded queue used by both chunk sorting and file
+output. Its job/count and payload budgets include queued and executing tasks.
+Submission can defer payload copies until capacity exists. `finish` waits for
+completion; failures and worker panics remain sticky and cancel queued tasks.
+Drop joins workers before releasing jobs and their workspace owners. Completed
+results kept by callers are outside the queue budget; sorting separately bounds
+those results. The two consumers use separate pool instances and budgets.

@@ -17,7 +17,9 @@ pub use tree::build_table;
 pub use update::{apply_changes, Change, MutationBatch, WorkingScan, WorkingTable};
 
 /// Stage immutable objects under IDs supplied by the codecs. Existing bytes
-/// must never be overwritten. Callers must supply the correct codec-produced
+/// must never be overwritten. File sinks may queue output and defer I/O errors
+/// until root staging or commit; successful put is not durable publication.
+/// Callers must supply the correct codec-produced
 /// ID for the bytes; sinks may trust existing objects without checking contents.
 pub trait ObjectSink {
     fn put(&mut self, id: Id, bytes: &[u8]) -> std::io::Result<()>;

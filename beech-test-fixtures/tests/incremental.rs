@@ -258,7 +258,7 @@ fn ordered_repeated_keys_stage_only_the_final_leaf() {
     assert_eq!(stats.branches_staged, 0);
     assert_eq!(stats.final_height, Some(0));
     assert_eq!(stats.peak_scratch_bytes, stats.input_bytes);
-    assert!(stats.peak_page_cache_bytes > 0);
+    assert!(stats.peak_decoded_bytes > 0);
     assert_eq!(stats.scratch_bytes_written, 0);
     assert!(stats.staged_bytes > 0);
 
@@ -303,14 +303,13 @@ fn ordered_edits_grow_collapse_empty_and_restart_the_tree() {
 }
 
 #[test]
-fn page_cache_limits_preserve_the_same_tree() {
+fn repeated_scratch_transactions_preserve_the_same_tree() {
     use beech_write::{SortLimits, Transaction};
     let (store, source, table) =
         build_simple_table("t", (0..50).map(|k| row(k, 0)).collect(), schema(), 256, 64).unwrap();
     let mut expected_root = None;
-    for limit in [0, 128, 8 * 1024 * 1024] {
-        let mut tx =
-            Transaction::new(schema(), SortLimits::default()).unwrap().with_page_cache_bytes(limit);
+    for budget in [0, 1024, 8 * 1024 * 1024] {
+        let mut tx = Transaction::new(schema(), SortLimits::default()).unwrap().with_decoded_budget(budget);
         for step in 0..200 {
             let key = step % 50;
             tx.push(Change::Update {
@@ -333,11 +332,11 @@ fn page_cache_limits_preserve_the_same_tree() {
             assert_eq!(root, expected);
         }
         expected_root = Some(root);
-        assert!(stats.peak_page_cache_bytes <= limit);
-        if limit == 8 * 1024 * 1024 {
+        if budget == 8 * 1024 * 1024 {
             assert_eq!(stats.scratch_bytes_written, 0);
         } else {
             assert!(stats.scratch_bytes_written > 0);
         }
+        assert!(stats.peak_decoded_bytes <= budget as u64);
     }
 }

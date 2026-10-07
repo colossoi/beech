@@ -1,6 +1,12 @@
 //! Portable transaction scratch space, atomic publication, and external sorting.
+mod worker;
+pub use worker::WorkerPool;
+mod output;
+pub use output::{FileOutput, FileOutputOptions, ThreadPoolFileOutput};
+mod kv;
 mod merge;
 mod pages;
+pub use kv::{RedbScratchStore, ScratchStore};
 pub use merge::IterMerger;
 pub use pages::{PageStats, PageStore};
 mod records;

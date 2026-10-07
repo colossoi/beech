@@ -27,23 +27,30 @@ splits have at least two children so even very small targets terminate.
 `Transaction::push` validates and spools incoming mutations to disk. A failed
 push discards its workspace and permanently rejects further use. `build` sorts
 rows using `beech-disk`, rejects duplicate keys, and streams the result into the
-bulk builder. `SortLimits` applies only to bulk creation (8 MiB and 32 merge
-inputs by default).
+bulk builder. `SortLimits` applies only to bulk creation (4 chunk workers,
+8 MiB per chunk and 32 merge inputs by default). Chunk sorting and run writing
+are parallel; merge, validation and tree shaping remain sequential. File output
+uses the same reusable worker scheduler with a separate pool.
 
 `apply` processes the input spool in submission order. Each mutation finds its
 leaf in a private working tree, reads that leaf, applies the change, and reshapes
 it using `ProbShaper`. Modified ancestors are reshaped too. Unchanged nodes retain
 immutable references; modified nodes use private temporary IDs in a
-`beech-disk::PageStore`. Decoded nodes stay in an 8 MiB LRU cache. Dirty pages are encoded and spilled into the transaction workspace only on eviction. Repeated resident edits
-perform no scratch encoding, decoding, or file I/O. `Transaction::with_page_cache_bytes(bytes)` changes the
-limit; zero forces disk-only operation. Spilled pages have no in-memory index.
+`beech-disk::PageStore`, backed by a disposable single-process redb database.
+Decoded working nodes use an 8 MiB LRU by default. Repeated edits replace the
+cached value without encoding or KV writes. Dirty evictions encode the latest
+version into redb; clean evictions need no write. Cache misses decode and retain
+spilled values. Oversized nodes bypass the cache. `Transaction::with_decoded_budget`
+and `WorkingTable::with_decoded_budget` configure this budget; zero disables it.
+Temporary writes are immediately readable and non-durable.
+The scratch backend also suppresses redb syncs during creation and shutdown.
 
 `WorkingTable` exposes the same mutable tree for callers that need to read
 unfinished edits. `apply` changes its private root immediately, `scan` plus
 `next_row` streams the current key-ordered view one row at a time, and `finish`
-stages only the reachable final nodes. Its scan retains one decoded leaf in
-addition to the bounded page cache; it does not materialize the table. Dropping
-the working table rolls back its scratch state. SQLite uses this interface for
+stages only the reachable final nodes, directly from the decoded cache or redb.
+Finalization does not flush dirty nodes to redb before encoding final objects.
+Its scan retains one active decoded leaf in addition to the working-node LRU. Dropping the working table rolls back its scratch state. SQLite uses this interface for
 read-your-writes transactions.
 
 The shared shaper has a cutoff at four times the logical target plus one record;
@@ -53,17 +60,20 @@ After every operation succeeds, finalization encodes only reachable working
 nodes, bottom-up, into Parquet leaves and Thrift branches. Intermediate versions
 never reach the object sink. Root publication still happens only at writer commit.
 On any processing or staging error, discard the transaction and abort the writer;
-there is no per-operation rollback. Spilled pages are written and closed before reuse, without durability syncs; this workspace is not a recovery log.
+there is no per-operation rollback. Temporary KV mutations use non-durable
+commits; this workspace is not a recovery log.
 
-Updates retain the current leaf, one branch per active ancestor, shaping groups,
-encoding buffers, the bounded decoded-page cache, and the repository caches. Large individual rows or existing
-nodes can still be expensive. The page budget counts node/vector storage and string/binary capacities. It
-excludes cache metadata and active copies or codec buffers; oversized pages bypass the cache. The default repository budgets are 16 MiB metadata
+Updates retain the decoded LRU, current leaf, one branch per active ancestor, shaping groups,
+encoding buffers, the redb cache, and the repository caches. Large individual
+rows or existing nodes can still be expensive. The default repository budgets are 16 MiB metadata
 and 128 MiB columns; active readers may retain evicted entries. Final encoding
 can hold rows, Arrow arrays, and Parquet bytes simultaneously. Bulk sorting has
 its own chunk/merge budgets and logarithmic run bookkeeping. Snapshot publication
 also holds a table-name/ID map proportional to the number of tables. These are
-working-set bounds, not a hard process-memory limit.
+working-set bounds, not a hard process-memory limit. The decoded budget counts
+node values and owned vector/string/binary capacities. LRU bookkeeping, allocator
+overhead and temporary clones are excluded. Drop discards dirty cached values;
+`PageStore::flush` explicitly writes them if a caller needs a scratch checkpoint.
 
 Splitting is local; there is no boundary realignment or sibling rebalancing.
 Deletions can leave underfull branches. The resulting tree is valid but its shape
@@ -79,7 +89,15 @@ writers. Readers do not acquire a lock. The lock releases on drop, including
 process exit; the `.beech-write.lock` file remains in the directory.
 
 Objects are staged in a private temporary directory on the same filesystem.
-Staging writes and closes objects without any file or directory syncs. Commit
+Staging queues completed object bytes through `beech-disk::FileOutput`. The default
+bounded thread pool creates, writes and closes files concurrently, without syncs.
+`FileWriter::with_output_options` configures worker/file/byte limits;
+`FileWriter::with_output` accepts another output backend for the private workspace.
+`put` may block for capacity and may defer worker errors. `stage_root` waits for
+all output before validating the root; commit also waits before installing objects.
+Abort/drop joins outstanding workers before deleting staging and releasing the
+writer lock. Snapshot metadata staging therefore waits for queued output.
+Commit
 walks the staging directory (no in-memory ID set), syncs each completed object’s
 contents, installs files without overwriting existing objects,
 and atomically replaces the text `root` pointer last. On macOS, object contents
@@ -108,12 +126,13 @@ publication, merge, and cursor integration tests.
 
 `Transaction::apply_with_stats` returns `(Table, TransactionStats)`. It records
 operation/no-op counts, leaf and branch visits, temporary rewrites, local splits,
-root collapses, final staged objects/bytes, elapsed apply time, cache hits/misses,
-evictions, peak resident page bytes, and peak scratch
-file bytes. Visits include repeated visits and no-ops; they are not distinct-node
+root collapses, final staged objects/bytes, elapsed apply time, peak logical
+scratch payload bytes and cumulative encoded page writes. Visits include repeated
+visits and no-ops; they are not distinct-node
 counts or physical disk reads. Finalization reads are excluded from visits.
-Scratch peak includes the input spool and temporary nodes, but not publication
-staging, filesystem allocation overhead, or the existing repository. Staged
+Scratch peak includes the input spool and live encoded temporary nodes, but not
+redb page overhead/cache, publication staging, filesystem allocation overhead, or
+the existing repository. Encoded writes do not measure physical disk I/O. Staged
 bytes count bytes passed to the sink before possible deduplication. Statistics
 currently cover ordered updates, not the bulk builder or snapshot publication.
 
@@ -142,15 +161,11 @@ This builds and commits 5,000 rows, then submits 1,000 seeded random inserts,
 updates, and deletes in one transaction. It uses the default 1,000-byte logical
 node target (the growth replay uses 128 bytes to expose splits). It verifies
 all final rows against an in-memory reference model and checks that the old
-snapshot remains readable. The printed update timings exclude initial creation
-and final verification; total update time includes workload generation and
-spooling. The temporary database is removed on exit.
+snapshot remains readable. The temporary database is removed after verification.
 
-The random-edit demo accepts `--cache-bytes BYTES` (default 8388608).
-Scratch bytes written now count actual disk spills; leaf/branch writes count
-logical page replacements, including replacements kept entirely in memory.
+Scratch bytes written count encoded payloads passed to the KV provider; leaf/branch
+writes count logical page replacements. These counters do not measure physical I/O.
 
-The page store receives encoding, decoding, and memory-size callbacks. Cached
-nodes remain decoded; only eviction encodes the private scratch representation,
-and only reloading invokes its decoder. Finalization directly produces published
-Parquet/Thrift objects. Shaping still encodes logical rows/keys to choose boundaries.
+The page store receives encoding and decoding callbacks. Finalization directly
+produces published Parquet/Thrift objects. Shaping still encodes logical rows/keys
+to choose boundaries.

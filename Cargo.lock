@@ -227,8 +227,8 @@ dependencies = [
 name = "beech-disk"
 version = "0.1.0"
 dependencies = [
- "beech-mem",
  "libc",
+ "redb",
  "tempfile",
  "windows-sys 0.61.2",
 ]
@@ -1075,6 +1075,15 @@ name = "rawpointer"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "60a357793950651c4ed0f3f52338f53b2f809f32d83a07f72909fa13e4c6c1e3"
+
+[[package]]
+name = "redb"
+version = "4.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb338a6c67830a61bed824b78c2bb034ab1ff401a20616bd7957524f4fdc2f22"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "regex"

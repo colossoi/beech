@@ -1,9 +1,9 @@
 use crate::{ObjectSink, Writer};
 use beech_core::Id;
-use beech_disk::{atomic_replace, Workspace};
+use beech_disk::{FileOutput, FileOutputOptions, ThreadPoolFileOutput, Workspace, atomic_replace};
 use std::{
     fs::{self, File},
-    io::{self, Write},
+    io,
     path::{Path, PathBuf},
 };
 
@@ -11,6 +11,7 @@ use std::{
 /// them, then atomically replaces root. Failure can leave unreferenced objects;
 /// a sync failure after root replacement has an ambiguous publication outcome.
 pub struct FileWriter {
+    output: Option<Box<dyn FileOutput>>,
     directory: PathBuf,
     staging: Workspace,
     objects: usize,
@@ -20,13 +21,31 @@ pub struct FileWriter {
 }
 impl FileWriter {
     pub fn new(directory: impl AsRef<Path>) -> io::Result<Self> {
+        Self::with_output_options(directory, FileOutputOptions::default())
+    }
+    pub fn with_output_options(
+        directory: impl AsRef<Path>,
+        options: FileOutputOptions,
+    ) -> io::Result<Self> {
+        Self::with_output(directory, |workspace| {
+            Ok(Box::new(ThreadPoolFileOutput::new(workspace, options)?))
+        })
+    }
+    /// The backend must target the supplied private workspace and obey FileOutput
+    /// completion/drop guarantees. Final durability remains owned by this writer.
+    pub fn with_output(
+        directory: impl AsRef<Path>,
+        make_output: impl FnOnce(&Workspace) -> io::Result<Box<dyn FileOutput>>,
+    ) -> io::Result<Self> {
         let directory = directory.as_ref().to_path_buf();
         fs::create_dir_all(&directory)?;
         #[cfg(not(unix))]
         beech_disk::sync_directory(&directory)?;
         let lock = beech_disk::lock(&directory.join(".beech-write.lock"))?;
         let staging = Workspace::in_directory(&directory)?;
+        let output = make_output(&staging)?;
         Ok(Self {
+            output: Some(output),
             directory,
             staging,
             objects: 0,
@@ -37,17 +56,18 @@ impl FileWriter {
 }
 impl ObjectSink for FileWriter {
     fn put(&mut self, id: Id, bytes: &[u8]) -> io::Result<()> {
-        let staged = self.staging.path().join(id.to_string());
-        if object_file_exists(&staged)? || object_file_exists(&self.directory.join(id.to_string()))? {
+        if object_file_exists(&self.directory.join(id.to_string()))? {
             return Ok(());
         }
-        self.staging.stage_file(&id.to_string(), |file| file.write_all(bytes))?;
-        self.objects += 1;
+        if self.output.as_mut().unwrap().submit(&id.to_string(), bytes)? {
+            self.objects += 1;
+        }
         Ok(())
     }
 }
 impl Writer for FileWriter {
     fn stage_root(&mut self, root_id: Id) -> io::Result<()> {
+        self.output.as_mut().unwrap().finish()?;
         if !object_file_exists(&self.staging.path().join(root_id.to_string()))?
             && !object_file_exists(&self.directory.join(root_id.to_string()))?
         {
@@ -59,14 +79,17 @@ impl Writer for FileWriter {
         self.root = Some(root_id);
         Ok(())
     }
-    fn commit(self) -> io::Result<()> {
+    fn commit(mut self) -> io::Result<()> {
+        self.output.as_mut().unwrap().finish()?;
+        drop(self.output.take());
         beech_disk::install_files(self.staging.path(), &self.directory)?;
         if let Some(root) = self.root {
             atomic_replace(&self.directory.join("root"), root.to_string().as_bytes())?;
         }
         Ok(())
     }
-    fn abort(self) -> io::Result<()> {
+    fn abort(mut self) -> io::Result<()> {
+        drop(self.output.take());
         self.staging.close()
     }
     fn num_to_commit(&self) -> usize {

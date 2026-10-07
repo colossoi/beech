@@ -1,8 +1,12 @@
-use crate::{IterMerger, Spool, Workspace};
+use crate::{IterMerger, Spool, WorkerPool, Workspace};
 use std::{
     cmp::Ordering,
+    collections::VecDeque,
     io::{self, BufRead, Write},
-    sync::Arc,
+    sync::{
+        mpsc::{self, Receiver},
+        Arc,
+    },
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -11,6 +15,7 @@ pub struct SortLimits {
     chunk_bytes: usize,
     /// Maximum input files/record heads in each merge; at least two.
     max_merge_inputs: usize,
+    workers: usize,
 }
 impl SortLimits {
     /// Limit accounted chunk memory and the number of input runs per merge.
@@ -25,7 +30,23 @@ impl SortLimits {
         Ok(Self {
             chunk_bytes,
             max_merge_inputs,
+            workers: 4,
         })
+    }
+    /// Parallel chunk sort/write workers; one selects the inline serial path.
+    /// At most this many submitted chunks plus one producer chunk are retained.
+    pub fn with_workers(mut self, workers: usize) -> io::Result<Self> {
+        if workers == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "sort workers must be positive",
+            ));
+        }
+        self.workers = workers;
+        Ok(self)
+    }
+    pub fn workers(&self) -> usize {
+        self.workers
     }
     pub fn chunk_bytes(&self) -> usize {
         self.chunk_bytes
@@ -39,6 +60,7 @@ impl Default for SortLimits {
         Self {
             chunk_bytes: 8 * 1024 * 1024,
             max_merge_inputs: 32,
+            workers: 4,
         }
     }
 }
@@ -46,9 +68,12 @@ impl Default for SortLimits {
 /// Sort bounded chunks and merge their heads. Each merge opens at most fan_in
 /// inputs; cascading levels bound run bookkeeping by O(fan_in * log(chunks)).
 pub struct ExternalSort<T, C> {
+    // Join workers before releasing outstanding run receivers and workspace.
+    pool: Option<WorkerPool>,
+    pending: VecDeque<Receiver<Spool>>,
     workspace: Workspace,
     options: SortLimits,
-    compare: C,
+    compare: Arc<C>,
     encode: fn(&T, &mut dyn Write) -> io::Result<()>,
     decode: fn(&mut dyn BufRead) -> io::Result<Option<T>>,
     memory_size: fn(&T) -> usize,
@@ -56,7 +81,7 @@ pub struct ExternalSort<T, C> {
     bytes: usize,
     levels: Vec<Vec<Spool>>,
 }
-impl<T, C: Fn(&T, &T) -> Ordering> ExternalSort<T, C> {
+impl<T: Send + 'static, C: Fn(&T, &T) -> Ordering + Send + Sync + 'static> ExternalSort<T, C> {
     /// Supply matching encoding and decoding functions for temporary runs.
     /// Decode one value per call, return `None` only at clean EOF, and report
     /// incomplete values as errors. Memory accounting should include owned allocations.
@@ -69,9 +94,11 @@ impl<T, C: Fn(&T, &T) -> Ordering> ExternalSort<T, C> {
         memory_size: fn(&T) -> usize,
     ) -> Self {
         Self {
+            pool: None,
+            pending: VecDeque::new(),
             workspace: workspace.clone(),
             options,
-            compare,
+            compare: Arc::new(compare),
             encode,
             decode,
             memory_size,
@@ -96,13 +123,50 @@ impl<T, C: Fn(&T, &T) -> Ordering> ExternalSort<T, C> {
         if self.buffer.is_empty() {
             return Ok(());
         }
-        self.buffer.sort_unstable_by(&self.compare);
-        let mut run = Spool::new(&self.workspace)?;
-        for record in self.buffer.drain(..) {
-            run.append(|writer| (self.encode)(&record, writer))?;
+        let buffer = std::mem::take(&mut self.buffer);
+        let bytes = std::mem::take(&mut self.bytes);
+        if self.options.workers == 1 {
+            let run = sorted_chunk(&self.workspace, buffer, self.compare.as_ref(), self.encode)?;
+            return self.add_run(run);
         }
-        run.seal()?;
-        self.bytes = 0;
+        if self.pool.is_none() {
+            self.pool = Some(WorkerPool::new(
+                "beech-sort",
+                self.options.workers,
+                self.options.workers,
+                self.options.chunk_bytes.saturating_mul(self.options.workers),
+            )?);
+        }
+        // Bound completed results too; integrate in submission order, independent
+        // of worker completion order. Merges remain on the coordinator.
+        if self.pending.len() >= self.options.workers {
+            self.collect_run()?;
+        }
+        let compare = self.compare.clone();
+        let workspace = self.workspace.clone();
+        let encode = self.encode;
+        let (send, receive) = mpsc::sync_channel(1);
+        self.pool.as_mut().unwrap().submit_with(bytes, || {
+            move || {
+                let run = sorted_chunk(&workspace, buffer, compare.as_ref(), encode)?;
+                send.send(run).map_err(|_| io::Error::other("sort result receiver dropped"))
+            }
+        })?;
+        self.pending.push_back(receive);
+        Ok(())
+    }
+    fn collect_run(&mut self) -> io::Result<()> {
+        let receive = self.pending.pop_front().unwrap();
+        let run = match receive.recv() {
+            Ok(run) => run,
+            Err(_) => {
+                self.pool.as_ref().unwrap().check()?;
+                return Err(io::Error::other("sort worker did not produce a run"));
+            }
+        };
+        self.add_run(run)
+    }
+    fn add_run(&mut self, mut run: Spool) -> io::Result<()> {
         let mut level = 0;
         loop {
             if self.levels.len() == level {
@@ -113,13 +177,25 @@ impl<T, C: Fn(&T, &T) -> Ordering> ExternalSort<T, C> {
                 break;
             }
             let runs = std::mem::take(&mut self.levels[level]);
-            run = merge(&self.workspace, runs, &self.compare, self.encode, self.decode)?;
+            run = merge(
+                &self.workspace,
+                runs,
+                self.compare.as_ref(),
+                self.encode,
+                self.decode,
+            )?;
             level += 1;
         }
         Ok(())
     }
     pub fn finish(mut self) -> io::Result<SortedRuns<T, C>> {
         self.flush()?;
+        while !self.pending.is_empty() {
+            self.collect_run()?;
+        }
+        if let Some(mut pool) = self.pool.take() {
+            pool.finish()?;
+        }
         let mut runs: Vec<_> = self.levels.into_iter().rev().flatten().collect();
         while runs.len() > self.options.max_merge_inputs {
             let count = runs.len().min(self.options.max_merge_inputs);
@@ -127,14 +203,14 @@ impl<T, C: Fn(&T, &T) -> Ordering> ExternalSort<T, C> {
             runs.push(merge(
                 &self.workspace,
                 inputs,
-                &self.compare,
+                self.compare.as_ref(),
                 self.encode,
                 self.decode,
             )?);
         }
         Ok(SortedRuns {
             runs,
-            compare: Arc::new(self.compare),
+            compare: self.compare,
             decode: self.decode,
         })
     }
@@ -162,6 +238,21 @@ impl<T, C: Fn(&T, &T) -> Ordering> SortedRuns<T, C> {
             self.runs.iter_mut().map(|run| decoded(run, self.decode)).collect::<io::Result<Vec<_>>>()?;
         IterMerger::with_compare(readers, self.compare.clone())
     }
+}
+
+fn sorted_chunk<T>(
+    workspace: &Workspace,
+    mut buffer: Vec<T>,
+    compare: &impl Fn(&T, &T) -> Ordering,
+    encode: fn(&T, &mut dyn Write) -> io::Result<()>,
+) -> io::Result<Spool> {
+    buffer.sort_unstable_by(compare);
+    let mut run = Spool::new(workspace)?;
+    for record in buffer {
+        run.append(|writer| encode(&record, writer))?;
+    }
+    run.seal()?;
+    Ok(run)
 }
 
 fn decoded<T>(
@@ -204,4 +295,43 @@ fn merge<T>(
     }
     output.seal()?;
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn read(reader: &mut dyn BufRead) -> io::Result<Option<u64>> {
+        let mut bytes = [0; 8];
+        if reader.fill_buf()?.is_empty() {
+            return Ok(None);
+        }
+        reader.read_exact(&mut bytes)?;
+        Ok(Some(u64::from_le_bytes(bytes)))
+    }
+    #[test]
+    fn encoder_failure_and_worker_panic_cleanup() {
+        for panic in [false, true] {
+            let workspace = Workspace::new().unwrap();
+            let path = workspace.path().to_owned();
+            let mut sort = ExternalSort::new(
+                &workspace,
+                SortLimits::new(8, 2).unwrap(),
+                move |a: &u64, b: &u64| {
+                    if panic {
+                        panic!("injected comparator panic");
+                    }
+                    a.cmp(b)
+                },
+                |_, _| Err(io::Error::other("injected run encoding failure")),
+                read,
+                |_| 8,
+            );
+            // Two records per chunk exercises comparator panic as well as codec failure.
+            sort.options.chunk_bytes = 16;
+            let result = sort.push(2).and_then(|_| sort.push(1)).and_then(|_| sort.finish().map(|_| ()));
+            assert!(result.is_err());
+            drop(workspace);
+            assert!(!path.exists());
+        }
+    }
 }

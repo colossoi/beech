@@ -255,3 +255,37 @@ fn ordered_updates_publish_only_at_commit_and_abort_on_staging_failure() {
         );
     }
 }
+
+#[test]
+fn deferred_output_failure_never_installs_objects_or_replaces_root() {
+    use beech_disk::{FileOutput, Workspace};
+    use std::io::{self, Write};
+    struct FailedOutput(Workspace);
+    impl FileOutput for FailedOutput {
+        fn submit(&mut self, name: &str, bytes: &[u8]) -> io::Result<bool> {
+            self.0.stage_file(name, |file| file.write_all(bytes))?;
+            Ok(true)
+        }
+        fn finish(&mut self) -> io::Result<()> {
+            Err(io::Error::other("injected deferred output failure"))
+        }
+    }
+    let directory = Workspace::new().unwrap();
+    publish(directory.path());
+    let original = fs::read(directory.path().join("root")).unwrap();
+    let object = codec::thrift::encode_root(&beech_core::Root::new(Id::default())).unwrap();
+    let mut writer = FileWriter::with_output(directory.path(), |workspace| {
+        Ok(Box::new(FailedOutput(workspace.clone())))
+    })
+    .unwrap();
+    writer.put(object.id(), object.bytes()).unwrap();
+    assert!(writer.stage_root(object.id()).is_err());
+    assert!(writer.commit().is_err());
+    assert_eq!(fs::read(directory.path().join("root")).unwrap(), original);
+    assert!(!directory.path().join(object.id().to_string()).exists());
+    assert!(
+        !fs::read_dir(directory.path())
+            .unwrap()
+            .any(|entry| { entry.unwrap().file_name().to_string_lossy().starts_with(".beech-stage-") })
+    );
+}

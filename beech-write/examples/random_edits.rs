@@ -7,7 +7,7 @@ use beech_core::{
 };
 use beech_disk::Workspace;
 use beech_write::{publish_table, BuildOptions, Change, FileWriter, SortLimits, Transaction, Writer};
-use std::{collections::BTreeMap, fs, sync::Arc, time::Instant};
+use std::{collections::BTreeMap, fs, sync::Arc};
 
 fn record(key: i64, value: String) -> Vec<Scalar> {
     vec![Scalar::Int64(key), Scalar::Utf8(value)]
@@ -55,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let initial_rows =
         RowCursor::new(&old_snapshot, &table, vec![])?.collect::<beech_core::Result<Vec<_>>>()?;
     let root_before = fs::read(directory.path().join("root"))?;
-    let mut tx = Transaction::new(schema, SortLimits::default())?.with_page_cache_bytes(cache_bytes);
+    let mut tx = Transaction::new(schema, SortLimits::default())?.with_decoded_budget(cache_bytes);
     // Fixed-seed xorshift64 makes the workload reproducible without a dependency.
     let mut seed = 0x4bee_c123_9876_abcd_u64;
     let mut random = || {
@@ -66,7 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let (mut inserts, mut updates, mut deletes) = (0, 0, 0);
     let mut next_row_id = 5_000;
-    let started = Instant::now();
+
     for step in 0..1_000 {
         let key = (random() % 6_000) as i64;
         let change = if let Some((row_id, _)) = model.get(&key) {
@@ -109,10 +109,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(initial.transaction_id),
     )?;
     assert_eq!(fs::read(directory.path().join("root"))?, root_before);
-    let commit_started = Instant::now();
+
     writer.commit()?;
-    let commit_elapsed = commit_started.elapsed();
-    let total_elapsed = started.elapsed();
 
     let snapshot = repository.snapshot(publication.root_id)?;
     let table = snapshot.table("demo")?;
@@ -129,12 +127,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         actual.len()
     );
     println!(
-        "Apply/finalize: {:.3}s; commit: {:.3}s; total update: {:.3}s",
-        stats.elapsed.as_secs_f64(),
-        commit_elapsed.as_secs_f64(),
-        total_elapsed.as_secs_f64()
-    );
-    println!(
         "Visits: {} leaves, {} branches; page rewrites: {} leaves, {} branches",
         stats.leaf_visits, stats.branch_visits, stats.leaf_writes, stats.branch_writes
     );
@@ -147,8 +139,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stats.peak_scratch_bytes, stats.scratch_bytes_written, stats.final_height
     );
     println!(
-        "Page cache: limit {cache_bytes} bytes, peak {} bytes, {} hits, {} misses, {} evictions",
-        stats.peak_page_cache_bytes, stats.page_cache_hits, stats.page_cache_misses, stats.page_evictions
+        "Decoded cache: limit {cache_bytes} bytes, peak {} bytes, {} hits, {} misses, {} evictions",
+        stats.peak_decoded_bytes,
+        stats.decoded_cache_hits,
+        stats.decoded_cache_misses,
+        stats.dirty_evictions
     );
     println!("Verified all rows, unchanged publication before commit, and old snapshot after commit.");
     Ok(())

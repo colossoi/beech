@@ -111,7 +111,6 @@ impl BeechTable {
                     self.table.as_ref().clone(),
                     self.repository.clone(),
                     BuildOptions::default(),
-                    8 * 1024 * 1024,
                 )?),
                 mutations: MutationBatch::new(SortLimits::default())?,
                 row_keys: RefCell::new(HashMap::new()),
@@ -369,7 +368,6 @@ impl TransactionVTab<'_> for BeechTable {
             self.table.as_ref().clone(),
             self.repository.clone(),
             BuildOptions::default(),
-            8 * 1024 * 1024,
         )
         .map_err(into_rusqlite_error)?;
         let mutations = std::mem::replace(

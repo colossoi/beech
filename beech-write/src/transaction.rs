@@ -1,7 +1,7 @@
 use crate::{BuildOptions, Change, ObjectSink, TransactionStats};
 use beech_core::{
-    codec::thrift::{decode_key, encode_key},
     BeechError, Id, Key, KeyOrdering, NodeRef, NodeSource, Result, Row, Scalar, Table, TableSchema,
+    codec::thrift::{decode_key, encode_key},
 };
 use beech_disk::{ExternalSort, SortLimits, SortedRuns, Spool, Workspace};
 use std::{
@@ -20,7 +20,7 @@ pub struct Transaction {
     scratch: Option<(Spool, Workspace)>,
     sort_limits: SortLimits,
     max_row_id: Option<i64>,
-    page_cache_bytes: usize,
+    decoded_budget: usize,
 }
 impl Transaction {
     /// Sort limits apply to bulk creation only.
@@ -31,13 +31,13 @@ impl Transaction {
             schema,
             sort_limits,
             max_row_id: None,
-            page_cache_bytes: 8 * 1024 * 1024,
+            decoded_budget: 8 * 1024 * 1024,
         })
     }
-    /// Set the mutable-page cache byte limit (default 8 MiB). Zero forces
-    /// disk-only updates. Does not affect the input spool or bulk creation.
-    pub fn with_page_cache_bytes(mut self, bytes: usize) -> Self {
-        self.page_cache_bytes = bytes;
+    /// Budget decoded working nodes for updates; zero disables retention.
+    /// Bulk import does not use the decoded working-node store.
+    pub fn with_decoded_budget(mut self, bytes: usize) -> Self {
+        self.decoded_budget = bytes;
         self
     }
     pub fn push(&mut self, change: Change) -> Result<()> {
@@ -125,7 +125,7 @@ impl Transaction {
         let input_bytes = reader.get_ref().metadata()?.len();
         crate::update::apply_ordered(
             records(reader, Change::read),
-            crate::update::WorkingNode::pages(&workspace, self.page_cache_bytes),
+            crate::update::WorkingNode::pages_with_budget(&workspace, self.decoded_budget)?,
             &updated,
             input_bytes,
             source,
@@ -375,8 +375,8 @@ mod framing_tests {
 mod failure_tests {
     use super::*;
     use beech_core::{
-        storage::{FileStore, Repository},
         DataType, Field,
+        storage::{FileStore, Repository},
     };
     struct NoWrites;
     impl ObjectSink for NoWrites {
@@ -400,11 +400,12 @@ mod failure_tests {
             let mut tx = Transaction::new(schema(), SortLimits::default()).unwrap();
             let path = tx.scratch.as_ref().unwrap().1.path().to_path_buf();
             tx.push(insert(1)).unwrap();
-            assert!(tx
-                .push(Change::Delete {
+            assert!(
+                tx.push(Change::Delete {
                     key: vec![Scalar::Utf8("bad".into())]
                 })
-                .is_err());
+                .is_err()
+            );
             assert!(!path.exists());
             assert!(tx.push(insert(2)).is_err());
             if build {
@@ -418,14 +419,47 @@ mod failure_tests {
     }
     #[test]
     fn workspace_write_failure_aborts_before_staging_and_cleans_up() {
-        let mut tx = Transaction::new(schema(), SortLimits::default()).unwrap().with_page_cache_bytes(0);
+        let mut tx = Transaction::new(schema(), SortLimits::default()).unwrap();
         tx.push(insert(1)).unwrap();
         let path = tx.scratch.as_ref().unwrap().1.path().to_path_buf();
-        // Force the first mutable node write to fail, without relying on permissions.
-        std::fs::create_dir(path.join("node-0")).unwrap();
+        struct FailStore {
+            _workspace: Workspace,
+        }
+        impl beech_disk::ScratchStore for FailStore {
+            fn get(&mut self, _: &[u8]) -> io::Result<Option<Vec<u8>>> {
+                Err(io::Error::other("injected scratch read failure"))
+            }
+            fn put(&mut self, _: &[u8], _: &[u8]) -> io::Result<Option<u64>> {
+                Err(io::Error::other("injected scratch write failure"))
+            }
+            fn delete(&mut self, _: &[u8]) -> io::Result<Option<u64>> {
+                Err(io::Error::other("injected scratch delete failure"))
+            }
+        }
         let source = Repository::new(FileStore::new(&path));
         let table = Table::new("t", schema(), None, -1).unwrap();
-        assert!(tx.apply(&table, &source, &mut NoWrites, BuildOptions::default()).is_err());
+        let (mut input, workspace) = tx.scratch.take().unwrap();
+        let reader = input.reader().unwrap();
+        let pages = beech_disk::PageStore::with_store(
+            FailStore {
+                _workspace: workspace,
+            },
+            |_, _| Ok(()),
+            |_| Err(io::Error::other("unexpected decode")),
+        );
+        assert!(
+            crate::update::apply_ordered(
+                records(reader, Change::read),
+                pages,
+                &table,
+                0,
+                &source,
+                &mut NoWrites,
+                BuildOptions::default(),
+            )
+            .is_err()
+        );
+        drop(input);
         assert!(!path.exists());
     }
     #[test]

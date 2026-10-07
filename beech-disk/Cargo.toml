@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-beech-mem = { path = "../beech-mem" }
+redb = "4.3"
 tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]

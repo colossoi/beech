@@ -208,14 +208,45 @@ impl Reference {
     }
 }
 
-// Private decoded working nodes. The scratch codec runs only when a page spills.
+// Private working nodes; scratch encoding is independent of final object formats.
 pub(crate) enum WorkingNode {
     Leaf(Vec<Row>),
     Branch(Vec<Reference>),
 }
 impl WorkingNode {
-    pub(crate) fn pages(workspace: &beech_disk::Workspace, limit: usize) -> PageStore<Self> {
-        PageStore::new(workspace, limit, Self::write, Self::read, Self::memory_size)
+    #[cfg(test)]
+    pub(crate) fn pages(workspace: &beech_disk::Workspace) -> io::Result<PageStore<Self>> {
+        Self::pages_with_budget(workspace, 8 * 1024 * 1024)
+    }
+    pub(crate) fn pages_with_budget(
+        workspace: &beech_disk::Workspace,
+        budget: usize,
+    ) -> io::Result<PageStore<Self>> {
+        Ok(PageStore::new(workspace, Self::write, Self::read)?.with_cache(budget, Self::decoded_size))
+    }
+    fn decoded_size(&self) -> usize {
+        fn key_bytes(key: &Vec<Scalar>) -> usize {
+            key.capacity() * std::mem::size_of::<Scalar>()
+                + key
+                    .iter()
+                    .map(|v| match v {
+                        Scalar::Utf8(v) => v.capacity(),
+                        Scalar::Binary(v) => v.capacity(),
+                        _ => 0,
+                    })
+                    .sum::<usize>()
+        }
+        std::mem::size_of::<Self>()
+            + match self {
+                Self::Leaf(rows) => {
+                    rows.capacity() * std::mem::size_of::<Row>()
+                        + rows.iter().map(|(_, row)| key_bytes(row)).sum::<usize>()
+                }
+                Self::Branch(children) => {
+                    children.capacity() * std::mem::size_of::<Reference>()
+                        + children.iter().map(|r| key_bytes(&r.key)).sum::<usize>()
+                }
+            }
     }
     fn write(&self, writer: &mut dyn Write) -> io::Result<()> {
         match self {
@@ -247,33 +278,9 @@ impl WorkingNode {
             _ => Err(io::Error::new(io::ErrorKind::InvalidData, "invalid working node")),
         }
     }
-    fn memory_size(&self) -> usize {
-        fn values(values: &Vec<Scalar>) -> usize {
-            values.capacity() * std::mem::size_of::<Scalar>()
-                + values
-                    .iter()
-                    .map(|v| match v {
-                        Scalar::Utf8(s) => s.capacity(),
-                        Scalar::Binary(b) => b.capacity(),
-                        _ => 0,
-                    })
-                    .sum::<usize>()
-        }
-        std::mem::size_of::<Self>()
-            + match self {
-                Self::Leaf(rows) => {
-                    rows.capacity() * std::mem::size_of::<Row>()
-                        + rows.iter().map(|r| values(&r.1)).sum::<usize>()
-                }
-                Self::Branch(children) => {
-                    children.capacity() * std::mem::size_of::<Reference>()
-                        + children.iter().map(|r| values(&r.key)).sum::<usize>()
-                }
-            }
-    }
 }
 
-/// A queryable, private table view backed by the same disk-spilling page cache
+/// A queryable, private table view backed by a decoded LRU and temporary key-value store
 /// used for incremental updates. Mutations are visible to scans immediately;
 /// dropping the value rolls them back.
 pub struct WorkingTable {
@@ -293,14 +300,22 @@ impl WorkingTable {
         table: Table,
         source: std::sync::Arc<dyn NodeSource>,
         options: BuildOptions,
-        page_cache_bytes: usize,
+    ) -> Result<Self> {
+        Self::with_decoded_budget(table, source, options, 8 * 1024 * 1024)
+    }
+    /// Budget retained decoded allocations; zero disables caching. Oversized nodes spill directly.
+    pub fn with_decoded_budget(
+        table: Table,
+        source: std::sync::Arc<dyn NodeSource>,
+        options: BuildOptions,
+        budget: usize,
     ) -> Result<Self> {
         let workspace = beech_disk::Workspace::new()?;
         let root = table.root().map(Reference::stored);
         let max_row_id = table.max_row_id();
         Ok(Self {
             tree: WorkingTree {
-                pages: WorkingNode::pages(&workspace, page_cache_bytes),
+                pages: WorkingNode::pages_with_budget(&workspace, budget)?,
                 table,
                 source,
                 options,
@@ -402,6 +417,7 @@ pub(crate) fn apply_ordered(
     options: BuildOptions,
 ) -> Result<(Table, TransactionStats)> {
     let started = std::time::Instant::now();
+
     let mut tree = WorkingTree {
         pages,
         table: table.clone(),
@@ -429,10 +445,10 @@ pub(crate) fn apply_ordered(
     let pages = tree.pages.stats();
     tree.stats.peak_scratch_bytes = input_bytes + pages.peak_disk_bytes;
     tree.stats.scratch_bytes_written = pages.bytes_written;
-    tree.stats.peak_page_cache_bytes = pages.peak_resident_bytes;
-    tree.stats.page_cache_hits = pages.hits;
-    tree.stats.page_cache_misses = pages.misses;
-    tree.stats.page_evictions = pages.evictions;
+    tree.stats.peak_decoded_bytes = pages.peak_cached_bytes;
+    tree.stats.decoded_cache_hits = pages.cache_hits;
+    tree.stats.decoded_cache_misses = pages.cache_misses;
+    tree.stats.dirty_evictions = pages.dirty_evictions;
     tree.stats.final_height = root.as_ref().map(NodeRef::height);
     tree.stats.elapsed = started.elapsed();
     Ok((table.with_root(root)?, tree.stats))
@@ -503,7 +519,9 @@ impl<S: NodeSource> WorkingTree<S> {
         match reference.location {
             Location::Stored(_) => {
                 let table = self.table.with_root(Some(reference.node(&self.table)?))?;
-                RowCursor::new(&self.source, &table, vec![])?.collect()
+                let result = RowCursor::new(&self.source, &table, vec![])?.collect();
+
+                result
             }
             Location::Working(id) => Ok(self.pages.read(id, |node| match node {
                 WorkingNode::Leaf(rows) => Ok(rows.clone()),
@@ -516,13 +534,17 @@ impl<S: NodeSource> WorkingTree<S> {
     }
     fn children(&mut self, reference: &Reference) -> Result<Vec<Reference>> {
         match reference.location {
-            Location::Stored(_) => Ok(self
-                .source
-                .get_internal(&reference.node(&self.table)?, self.table.schema())?
-                .children()
-                .iter()
-                .map(Reference::stored)
-                .collect()),
+            Location::Stored(_) => {
+                let children = self
+                    .source
+                    .get_internal(&reference.node(&self.table)?, self.table.schema())?
+                    .children()
+                    .iter()
+                    .map(Reference::stored)
+                    .collect();
+
+                Ok(children)
+            }
             Location::Working(id) => Ok(self.pages.read(id, |node| match node {
                 WorkingNode::Branch(children) => Ok(children.clone()),
                 _ => Err(io::Error::new(
@@ -629,6 +651,7 @@ impl<S: NodeSource> WorkingTree<S> {
         }
         let mut reuse = Self::reuse(reference);
         let mut output = vec![];
+
         shape(
             rows.into_iter().map(Ok),
             self.options,
@@ -653,6 +676,7 @@ impl<S: NodeSource> WorkingTree<S> {
     }
     fn branches(&mut self, children: Vec<Reference>, mut reuse: Option<u64>) -> Result<Vec<Reference>> {
         let mut output = vec![];
+
         shape(
             children.into_iter().map(Ok),
             self.options,
@@ -726,7 +750,7 @@ mod tests {
         let schema = TableSchema::new(vec![Field::new("k", DataType::Int64, false)], vec![0]).unwrap();
         let table = Table::new("t", schema, None, -1).unwrap();
         let source = std::sync::Arc::new(Repository::new(FileStore::new(workspace.path())));
-        let mut working = WorkingTable::new(table, source, BuildOptions::new(64, 8).unwrap(), 0).unwrap();
+        let mut working = WorkingTable::new(table, source, BuildOptions::new(64, 8).unwrap()).unwrap();
         for value in (0..100).rev() {
             working
                 .apply(Change::Insert {
@@ -760,18 +784,18 @@ mod tests {
         }
         assert_eq!(rows.len(), 99);
         assert!(rows.windows(2).all(|rows| rows[0].1[0].compare(&rows[1].1[0]).unwrap().is_lt()));
-        assert_eq!(working.page_stats().resident_bytes, 0);
-        assert!(working.page_stats().bytes_written > 0);
+        assert!(working.page_stats().cached_bytes > 0);
+        assert_eq!(working.page_stats().bytes_written, 0);
     }
 
     #[test]
-    fn repeated_edits_reuse_the_same_cached_page() {
+    fn repeated_edits_reuse_the_same_temporary_id() {
         let workspace = Workspace::new().unwrap();
         let schema = TableSchema::new(vec![Field::new("k", DataType::Int64, false)], vec![0]).unwrap();
         let table = Table::new("t", schema, None, 100).unwrap();
         let source = std::sync::Arc::new(Repository::new(FileStore::new(workspace.path())));
         let mut tree = WorkingTree {
-            pages: WorkingNode::pages(&workspace, 4096),
+            pages: WorkingNode::pages(&workspace).unwrap(),
             table,
             source,
             options: BuildOptions::new(100_000, 1).unwrap(),
@@ -808,11 +832,9 @@ mod tests {
             assert_eq!(tree.stats.leaf_writes, id as u64 + 1);
             assert_eq!(tree.stats.leaf_visits, id as u64);
             assert_eq!(tree.pages.stats().bytes_written, 0);
-            assert!(tree.pages.stats().resident_bytes <= 4096);
             assert_eq!(tree.next_id, 1);
-            assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
+            assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 1);
         }
         tree.remove(&nodes[0]).unwrap();
-        assert_eq!(tree.pages.stats().resident_bytes, 0);
     }
 }

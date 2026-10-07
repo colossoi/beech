@@ -24,10 +24,10 @@ impl Number {
 #[test]
 fn external_sort_merges_many_runs_with_small_fan_in() {
     let workspace = Workspace::new().unwrap();
-    for memory_bytes in [1, 40, 100_000] {
+    for (memory_bytes, workers) in [(1, 1), (1, 4), (40, 4), (100_000, 4)] {
         let mut sort = ExternalSort::new(
             &workspace,
-            SortLimits::new(memory_bytes, 3).unwrap(),
+            SortLimits::new(memory_bytes, 3).unwrap().with_workers(workers).unwrap(),
             |a: &Number, b: &Number| a.0.cmp(&b.0),
             Number::write,
             Number::read,
@@ -56,13 +56,11 @@ fn publication_is_complete_and_never_clobbers_immutable_files() {
     );
     assert_eq!(fs::read(&path).unwrap(), b"original");
     let failed = workspace.path().join("failed");
-    assert!(
-        atomic_write(&failed, |f| {
-            f.write_all(b"partial")?;
-            Err(io::Error::other("injected"))
-        })
-        .is_err()
-    );
+    assert!(atomic_write(&failed, |f| {
+        f.write_all(b"partial")?;
+        Err(io::Error::other("injected"))
+    })
+    .is_err());
     assert!(!failed.exists());
     assert_eq!(fs::read_dir(workspace.path()).unwrap().count(), 1);
     atomic_replace(&path, b"replacement").unwrap();
@@ -90,14 +88,12 @@ fn failed_spool_write_cannot_be_read_as_a_successful_prefix() {
     let workspace = Workspace::new().unwrap();
     let mut spool = Spool::new(&workspace).unwrap();
     spool.append(|writer| Number(1).write(writer)).unwrap();
-    assert!(
-        spool
-            .append(|writer| {
-                writer.write_all(b"partial")?;
-                Err(io::Error::other("injected"))
-            })
-            .is_err()
-    );
+    assert!(spool
+        .append(|writer| {
+            writer.write_all(b"partial")?;
+            Err(io::Error::other("injected"))
+        })
+        .is_err());
     assert!(spool.reader().is_err());
     assert!(spool.append(|writer| Number(2).write(writer)).is_err());
 }
@@ -131,32 +127,36 @@ fn sort_live_records_remain_bounded_as_input_grows() {
             8
         }
     }
-    let workspace = Workspace::new().unwrap();
-    let path = workspace.path().to_owned();
-    let mut sort = ExternalSort::new(
-        &workspace,
-        SortLimits::new(128, 3).unwrap(),
-        |a: &Tracked, b: &Tracked| a.0.cmp(&b.0),
-        Tracked::write,
-        Tracked::read,
-        Tracked::memory_size,
-    );
-    for i in (0..5000).rev() {
-        sort.push(Tracked::new(i)).unwrap();
-        assert!(
-            fs::read_dir(&path).unwrap().count() < 30,
-            "run bookkeeping grew with input"
+    for workers in [1, 4] {
+        PEAK.store(0, Ordering::SeqCst);
+        let workspace = Workspace::new().unwrap();
+        let path = workspace.path().to_owned();
+        let mut sort = ExternalSort::new(
+            &workspace,
+            SortLimits::new(128, 3).unwrap().with_workers(workers).unwrap(),
+            |a: &Tracked, b: &Tracked| a.0.cmp(&b.0),
+            Tracked::write,
+            Tracked::read,
+            Tracked::memory_size,
         );
+        for i in (0..5000).rev() {
+            sort.push(Tracked::new(i)).unwrap();
+            assert!(
+                fs::read_dir(&path).unwrap().count() < 30 + workers,
+                "run bookkeeping grew with input"
+            );
+        }
+        let mut output = sort.finish().unwrap();
+        for (expected, row) in output.reader().unwrap().enumerate() {
+            assert_eq!(row.unwrap().0, expected as u64);
+        }
+        let bound = if workers == 1 { 17 } else { 16 * (workers + 1) + 4 };
+        assert!(PEAK.load(Ordering::SeqCst) <= bound);
+        assert_eq!(LIVE.load(Ordering::SeqCst), 0);
+        drop(output);
+        drop(workspace);
+        assert!(!path.exists());
     }
-    let mut output = sort.finish().unwrap();
-    for (expected, row) in output.reader().unwrap().enumerate() {
-        assert_eq!(row.unwrap().0, expected as u64);
-    }
-    assert!(PEAK.load(Ordering::SeqCst) <= 17);
-    assert_eq!(LIVE.load(Ordering::SeqCst), 0);
-    drop(output);
-    drop(workspace);
-    assert!(!path.exists());
 }
 
 #[test]
@@ -291,14 +291,12 @@ fn unsupported_directory_sync_prevents_publication() {
 #[test]
 fn staging_cleans_up_partial_writes_and_never_replaces_files() {
     let workspace = Workspace::new().unwrap();
-    assert!(
-        workspace
-            .stage_file("object", |file| {
-                file.write_all(b"partial")?;
-                Err(io::Error::other("injected write failure"))
-            })
-            .is_err()
-    );
+    assert!(workspace
+        .stage_file("object", |file| {
+            file.write_all(b"partial")?;
+            Err(io::Error::other("injected write failure"))
+        })
+        .is_err());
     assert_eq!(fs::read_dir(workspace.path()).unwrap().count(), 0);
     workspace
         .stage_file("object", |file| {
