@@ -1,4 +1,4 @@
-//! Read-only SQLite tables backed by Beech repository snapshots.
+//! Writable SQLite tables backed by Beech repository snapshots.
 //!
 //! Register with [create_beech_module], then:
 //!
@@ -19,24 +19,30 @@ use arrow_array::{
     StringArray, UInt64Array,
 };
 use beech_core::{
-    BeechError, DataType, Id, RecordBatch, Scalar, Table,
+    BeechError, DataType, Decimal, Id, Key, KeyOrdering, RecordBatch, Row, Scalar, Table,
     plan::CandidateConstraint,
     query::{ConstraintOp, Scan},
     storage::{FileStore, Repository},
+};
+use beech_write::{
+    BuildOptions, Change, FileWriter, MutationBatch, SortLimits, WorkingScan, WorkingTable, Writer,
+    publish_table,
 };
 use plan::AccessPlan;
 use rusqlite::{
     Result,
     types::ValueRef,
     vtab::{
-        Context, CreateVTab, Filters, IndexConstraintOp, IndexInfo, Module, VTab, VTabConnection,
-        VTabCursor, VTabKind, sqlite3_vtab, sqlite3_vtab_cursor,
+        Context, CreateVTab, Filters, IndexConstraintOp, IndexInfo, Inserts, Module, TransactionVTab,
+        UpdateVTab, Updates, VTab, VTabConnection, VTabCursor, VTabKind, sqlite3_vtab, sqlite3_vtab_cursor,
     },
 };
 use std::{
     borrow::Cow,
+    cell::RefCell,
+    collections::{BTreeMap, HashMap},
     ffi::{CStr, CString, c_int},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -48,6 +54,27 @@ struct BeechTable {
     repository: Arc<Repository>,
     table: Arc<Table>,
     table_id: Id,
+    data_path: PathBuf,
+    table_name: String,
+    root_id: Id,
+    transaction_id: Id,
+    tables: BTreeMap<String, Id>,
+    write: Option<WriteState>,
+}
+
+struct WriteState {
+    working: RefCell<WorkingTable>,
+    mutations: MutationBatch,
+    row_keys: RefCell<HashMap<i64, Key>>,
+    dirty: bool,
+    pending_commit: Option<PendingCommit>,
+}
+
+struct PendingCommit {
+    writer: FileWriter,
+    table: Table,
+    root_id: Id,
+    table_id: Id,
 }
 
 impl BeechTable {
@@ -56,6 +83,7 @@ impl BeechTable {
         let repository = Arc::new(Repository::new(FileStore::new(path)));
         let root_id = Id::from_hex(std::fs::read_to_string(path.join("root"))?.trim())?;
         let snapshot = repository.snapshot(root_id)?;
+        let transaction_id = repository.get_root(&root_id)?.transaction_id();
         let table = snapshot.table(table_name)?;
         let table_id = *snapshot
             .transaction()
@@ -67,7 +95,31 @@ impl BeechTable {
             repository,
             table,
             table_id,
+            data_path: path.to_owned(),
+            table_name: table_name.into(),
+            root_id,
+            transaction_id,
+            tables: snapshot.transaction().tables().clone(),
+            write: None,
         })
+    }
+
+    fn ensure_write(&mut self) -> beech_core::Result<&mut WriteState> {
+        if self.write.is_none() {
+            self.write = Some(WriteState {
+                working: RefCell::new(WorkingTable::new(
+                    self.table.as_ref().clone(),
+                    self.repository.clone(),
+                    BuildOptions::default(),
+                    8 * 1024 * 1024,
+                )?),
+                mutations: MutationBatch::new(SortLimits::default())?,
+                row_keys: RefCell::new(HashMap::new()),
+                dirty: false,
+                pending_commit: None,
+            });
+        }
+        Ok(self.write.as_mut().expect("initialized above"))
     }
 }
 
@@ -168,12 +220,206 @@ unsafe impl<'vtab> VTab<'vtab> for BeechTable {
             batch: None,
             row: 0,
             projection: Vec::new(),
+            transaction_scan: None,
+            transaction_row: None,
         })
     }
 }
 
 impl<'vtab> CreateVTab<'vtab> for BeechTable {
     const KIND: VTabKind = VTabKind::Default;
+}
+
+impl UpdateVTab<'_> for BeechTable {
+    fn delete(&mut self, arg: ValueRef<'_>) -> Result<()> {
+        let row_id = sqlite_row_id(arg)?;
+        let schema = self.table.schema().clone();
+        let state = self.ensure_write().map_err(into_rusqlite_error)?;
+        let working = state.working.get_mut();
+        let key = match state.row_keys.get_mut().remove(&row_id) {
+            Some(key) => key,
+            None => {
+                let row = working
+                    .row_by_id(row_id)
+                    .map_err(into_rusqlite_error)?
+                    .ok_or_else(|| rusqlite::Error::ModuleError(format!("no row with rowid {row_id}")))?;
+                schema.key_from_row(&row).map_err(into_rusqlite_error)?
+            }
+        };
+        let change = Change::Delete { key };
+        state.mutations.push(change.clone()).map_err(into_rusqlite_error)?;
+        working.apply(change).map_err(into_rusqlite_error)?;
+        state.dirty = true;
+        Ok(())
+    }
+
+    fn insert(&mut self, args: &Inserts<'_>) -> Result<i64> {
+        let schema = self.table.schema().clone();
+        check_mutation_arity(args.len(), schema.fields().len())?;
+        let requested = args.iter().nth(1).expect("arity checked");
+        let record = sqlite_record(&schema, args.iter().skip(2))?;
+        let state = self.ensure_write().map_err(into_rusqlite_error)?;
+        let working = state.working.get_mut();
+        let (row_id, explicit_row_id) = match requested {
+            ValueRef::Null => (working.next_row_id().map_err(into_rusqlite_error)?, false),
+            value => (sqlite_row_id(value)?, true),
+        };
+        if explicit_row_id && working.row_by_id(row_id).map_err(into_rusqlite_error)?.is_some() {
+            return Err(rusqlite::Error::ModuleError(format!("duplicate rowid {row_id}")));
+        }
+        let key = schema.key_from_row(&(row_id, record.clone())).map_err(into_rusqlite_error)?;
+        if working.row_by_key(&key).map_err(into_rusqlite_error)?.is_some() {
+            return Err(rusqlite::Error::ModuleError("duplicate key".into()));
+        }
+        let change = Change::Insert { key, row_id, record };
+        state.mutations.push(change.clone()).map_err(into_rusqlite_error)?;
+        working.apply(change).map_err(into_rusqlite_error)?;
+        state.dirty = true;
+        Ok(row_id)
+    }
+
+    fn update(&mut self, args: &Updates<'_>) -> Result<()> {
+        let schema = self.table.schema().clone();
+        check_mutation_arity(args.len(), schema.fields().len())?;
+        let mut values = args.iter();
+        let old_row_id = sqlite_row_id(values.next().expect("arity checked"))?;
+        let new_row_id = sqlite_row_id(values.next().expect("arity checked"))?;
+        let record = sqlite_record(&schema, values)?;
+        let state = self.ensure_write().map_err(into_rusqlite_error)?;
+        let working = state.working.get_mut();
+        let old_key = match state.row_keys.get_mut().remove(&old_row_id) {
+            Some(key) => key,
+            None => {
+                let row = working.row_by_id(old_row_id).map_err(into_rusqlite_error)?.ok_or_else(|| {
+                    rusqlite::Error::ModuleError(format!("no row with rowid {old_row_id}"))
+                })?;
+                schema.key_from_row(&row).map_err(into_rusqlite_error)?
+            }
+        };
+        if old_row_id != new_row_id && working.row_by_id(new_row_id).map_err(into_rusqlite_error)?.is_some()
+        {
+            return Err(rusqlite::Error::ModuleError(format!(
+                "duplicate rowid {new_row_id}"
+            )));
+        }
+        let new_key = schema.key_from_row(&(new_row_id, record.clone())).map_err(into_rusqlite_error)?;
+        if old_key.compare_key(&new_key).map_err(into_rusqlite_error)?.is_ne()
+            && working.row_by_key(&new_key).map_err(into_rusqlite_error)?.is_some()
+        {
+            return Err(rusqlite::Error::ModuleError("duplicate key".into()));
+        }
+        if old_key.compare_key(&new_key).map_err(into_rusqlite_error)?.is_eq() {
+            let change = Change::Update {
+                key: new_key,
+                row_id: new_row_id,
+                record,
+            };
+            state.mutations.push(change.clone()).map_err(into_rusqlite_error)?;
+            working.apply(change).map_err(into_rusqlite_error)?;
+        } else {
+            let delete = Change::Delete { key: old_key };
+            let insert = Change::Insert {
+                key: new_key,
+                row_id: new_row_id,
+                record,
+            };
+            state.mutations.push(delete.clone()).map_err(into_rusqlite_error)?;
+            state.mutations.push(insert.clone()).map_err(into_rusqlite_error)?;
+            working.apply(delete).map_err(into_rusqlite_error)?;
+            working.apply(insert).map_err(into_rusqlite_error)?;
+        }
+        state.dirty = true;
+        Ok(())
+    }
+}
+
+impl TransactionVTab<'_> for BeechTable {
+    fn begin(&mut self) -> Result<()> {
+        self.write = None;
+        Ok(())
+    }
+
+    fn sync(&mut self) -> Result<()> {
+        let Some(mut state) = self.write.take() else {
+            return Ok(());
+        };
+        if !state.dirty {
+            self.write = Some(state);
+            return Ok(());
+        }
+        if state.pending_commit.is_some() {
+            self.write = Some(state);
+            return Ok(());
+        }
+        let mut writer =
+            FileWriter::new(&self.data_path).map_err(BeechError::from).map_err(into_rusqlite_error)?;
+        let current_root = Id::from_hex(
+            std::fs::read_to_string(self.data_path.join("root"))
+                .map_err(BeechError::from)
+                .map_err(into_rusqlite_error)?
+                .trim(),
+        )
+        .map_err(into_rusqlite_error)?;
+        if current_root != self.root_id {
+            return Err(rusqlite::Error::ModuleError(
+                "repository changed since this virtual table connected".into(),
+            ));
+        }
+        let mut commit_view = WorkingTable::new(
+            self.table.as_ref().clone(),
+            self.repository.clone(),
+            BuildOptions::default(),
+            8 * 1024 * 1024,
+        )
+        .map_err(into_rusqlite_error)?;
+        let mutations = std::mem::replace(
+            &mut state.mutations,
+            MutationBatch::new(SortLimits::default()).map_err(into_rusqlite_error)?,
+        );
+        mutations.apply(&mut commit_view).map_err(into_rusqlite_error)?;
+        let table = commit_view.finish(&mut writer).map_err(into_rusqlite_error)?;
+        let publication = publish_table(
+            &mut writer,
+            &table,
+            self.tables.clone(),
+            Some(self.transaction_id),
+        )
+        .map_err(into_rusqlite_error)?;
+        state.pending_commit = Some(PendingCommit {
+            writer,
+            table,
+            root_id: publication.root_id,
+            table_id: publication.table_id,
+        });
+        self.write = Some(state);
+        Ok(())
+    }
+
+    fn commit(&mut self) -> Result<()> {
+        let Some(mut state) = self.write.take() else {
+            return Ok(());
+        };
+        let Some(pending) = state.pending_commit.take() else {
+            return Ok(());
+        };
+        pending.writer.commit().map_err(BeechError::from).map_err(into_rusqlite_error)?;
+        self.table = Arc::new(pending.table);
+        self.table_id = pending.table_id;
+        self.root_id = pending.root_id;
+        self.tables.insert(self.table_name.clone(), pending.table_id);
+        self.transaction_id =
+            self.repository.get_root(&pending.root_id).map_err(into_rusqlite_error)?.transaction_id();
+        Ok(())
+    }
+
+    fn rollback(&mut self) -> Result<()> {
+        if let Some(mut state) = self.write.take()
+            && let Some(pending) = state.pending_commit.take()
+        {
+            pending.writer.abort().map_err(BeechError::from).map_err(into_rusqlite_error)?;
+        }
+        Ok(())
+    }
 }
 
 fn order_by_matches_key(info: &IndexInfo, table: &Table) -> bool {
@@ -216,6 +462,88 @@ fn search_value(typ: &DataType, value: ValueRef<'_>) -> Option<Scalar> {
     })
 }
 
+fn check_mutation_arity(actual: usize, columns: usize) -> Result<()> {
+    if actual == columns + 2 {
+        Ok(())
+    } else {
+        Err(rusqlite::Error::ModuleError(format!(
+            "mutation has {actual} arguments, expected {}",
+            columns + 2
+        )))
+    }
+}
+
+fn sqlite_row_id(value: ValueRef<'_>) -> Result<i64> {
+    match value {
+        ValueRef::Integer(value) => Ok(value),
+        _ => Err(rusqlite::Error::ModuleError("rowid must be an integer".into())),
+    }
+}
+
+fn sqlite_record<'a>(
+    schema: &beech_core::TableSchema,
+    values: impl Iterator<Item = ValueRef<'a>>,
+) -> Result<Vec<Scalar>> {
+    schema
+        .fields()
+        .iter()
+        .zip(values)
+        .map(|(field, value)| sqlite_scalar(field.data_type(), value))
+        .collect()
+}
+
+fn sqlite_scalar(typ: &DataType, value: ValueRef<'_>) -> Result<Scalar> {
+    if matches!(value, ValueRef::Null) {
+        return Ok(Scalar::Null);
+    }
+    let invalid = || rusqlite::Error::ModuleError(format!("value does not match {typ}"));
+    match (typ, value) {
+        (DataType::Boolean, ValueRef::Integer(0)) => Ok(Scalar::Boolean(false)),
+        (DataType::Boolean, ValueRef::Integer(1)) => Ok(Scalar::Boolean(true)),
+        (DataType::Int32, ValueRef::Integer(value)) => {
+            value.try_into().map(Scalar::Int32).map_err(|_| invalid())
+        }
+        (DataType::Int64, ValueRef::Integer(value)) => Ok(Scalar::Int64(value)),
+        (DataType::UInt64, ValueRef::Text(value)) => std::str::from_utf8(value)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .map(Scalar::UInt64)
+            .ok_or_else(invalid),
+        (DataType::Float32, ValueRef::Real(value)) => Ok(Scalar::Float32(value as f32)),
+        (DataType::Float32, ValueRef::Integer(value)) => Ok(Scalar::Float32(value as f32)),
+        (DataType::Float64, ValueRef::Real(value)) => Ok(Scalar::Float64(value)),
+        (DataType::Float64, ValueRef::Integer(value)) => Ok(Scalar::Float64(value as f64)),
+        (DataType::Decimal128(_, scale), ValueRef::Text(value)) => {
+            let value = std::str::from_utf8(value).map_err(|_| invalid())?;
+            parse_decimal(value, u8::try_from(*scale).map_err(|_| invalid())?)
+                .map(Scalar::Decimal)
+                .ok_or_else(invalid)
+        }
+        (DataType::Utf8, ValueRef::Text(value)) => {
+            std::str::from_utf8(value).map(|value| Scalar::Utf8(value.into())).map_err(|_| invalid())
+        }
+        (DataType::Binary, ValueRef::Blob(value)) => Ok(Scalar::Binary(value.into())),
+        _ => Err(invalid()),
+    }
+}
+
+fn parse_decimal(text: &str, scale: u8) -> Option<Decimal> {
+    let (negative, unsigned) = text.strip_prefix('-').map_or((false, text), |rest| (true, rest));
+    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|b| b.is_ascii_digit())
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+        || fraction.len() > scale as usize
+    {
+        return None;
+    }
+    let digits = format!("{whole}{fraction:0<width$}", width = scale as usize);
+    let unsigned: u128 = digits.parse().ok()?;
+    let unscaled =
+        if negative { -(i128::try_from(unsigned).ok()?) } else { i128::try_from(unsigned).ok()? };
+    Decimal::new(unscaled, scale).ok()
+}
+
 #[repr(C)]
 struct BeechCursor<'vtab> {
     base: sqlite3_vtab_cursor,
@@ -224,6 +552,8 @@ struct BeechCursor<'vtab> {
     batch: Option<RecordBatch>,
     row: usize,
     projection: Vec<usize>,
+    transaction_scan: Option<WorkingScan>,
+    transaction_row: Option<Row>,
 }
 
 impl BeechCursor<'_> {
@@ -245,6 +575,24 @@ impl BeechCursor<'_> {
     fn current_batch(&self) -> Result<&RecordBatch> {
         self.batch.as_ref().ok_or_else(|| rusqlite::Error::ModuleError("cursor is at EOF".into()))
     }
+
+    fn next_transaction_row(&mut self) -> Result<()> {
+        let Some(scan) = &mut self.transaction_scan else {
+            return Ok(());
+        };
+        let write = self
+            .vtab
+            .write
+            .as_ref()
+            .ok_or_else(|| rusqlite::Error::ModuleError("transaction ended during scan".into()))?;
+        self.transaction_row = write
+            .working
+            .try_borrow_mut()
+            .map_err(|_| rusqlite::Error::ModuleError("working table is already borrowed".into()))?
+            .next_row(scan)
+            .map_err(into_rusqlite_error)?;
+        Ok(())
+    }
 }
 
 // SAFETY: repr(C), with the required base first. SQLite closes cursors before
@@ -253,6 +601,9 @@ unsafe impl VTabCursor for BeechCursor<'_> {
     fn filter(&mut self, _idx_num: c_int, idx_str: Option<&str>, args: &Filters<'_>) -> Result<()> {
         self.scan = None;
         self.batch = None;
+        self.transaction_scan = None;
+        self.transaction_row = None;
+        self.row = 0;
         let text = idx_str.ok_or_else(|| rusqlite::Error::ModuleError("missing access plan".into()))?;
         let plan = AccessPlan::decode(&from_hex(text).map_err(into_rusqlite_error)?)
             .map_err(into_rusqlite_error)?;
@@ -277,6 +628,15 @@ unsafe impl VTabCursor for BeechCursor<'_> {
         let request =
             plan.bind(self.vtab.table_id, &self.vtab.table, &values).map_err(into_rusqlite_error)?;
         self.projection.clone_from(&request.projection);
+        if let Some(write) = &self.vtab.write {
+            let scan = write
+                .working
+                .try_borrow()
+                .map_err(|_| rusqlite::Error::ModuleError("working table is already borrowed".into()))?
+                .scan();
+            self.transaction_scan = Some(scan);
+            return self.next_transaction_row();
+        }
         self.scan = Some(
             Scan::new(self.vtab.repository.as_ref(), &self.vtab.table, request)
                 .map_err(into_rusqlite_error)?,
@@ -285,6 +645,9 @@ unsafe impl VTabCursor for BeechCursor<'_> {
     }
 
     fn next(&mut self) -> Result<()> {
+        if self.transaction_scan.is_some() {
+            return self.next_transaction_row();
+        }
         if let Some(batch) = &self.batch {
             self.row += 1;
             if self.row >= batch.num_rows() {
@@ -295,12 +658,16 @@ unsafe impl VTabCursor for BeechCursor<'_> {
     }
 
     fn eof(&self) -> bool {
-        self.batch.is_none()
+        if self.transaction_scan.is_some() { self.transaction_row.is_none() } else { self.batch.is_none() }
     }
 
     fn column(&self, ctx: &mut Context, column: c_int) -> Result<()> {
         let column =
             usize::try_from(column).map_err(|_| rusqlite::Error::InvalidColumnIndex(usize::MAX))?;
+        if let Some(row) = &self.transaction_row {
+            let value = row.1.get(column).ok_or(rusqlite::Error::InvalidColumnIndex(column))?;
+            return set_scalar(ctx, value);
+        }
         let projected = self
             .projection
             .iter()
@@ -314,6 +681,18 @@ unsafe impl VTabCursor for BeechCursor<'_> {
     }
 
     fn rowid(&self) -> Result<i64> {
+        if self.transaction_scan.is_some() {
+            let row = self
+                .transaction_row
+                .as_ref()
+                .ok_or_else(|| rusqlite::Error::ModuleError("cursor is at EOF".into()));
+            let row = row?;
+            if let Some(write) = &self.vtab.write {
+                let key = self.vtab.table.schema().key_from_row(row).map_err(into_rusqlite_error)?;
+                write.row_keys.borrow_mut().insert(row.0, key);
+            }
+            return Ok(row.0);
+        }
         let array = self
             .current_batch()?
             .column(0)
@@ -322,6 +701,32 @@ unsafe impl VTabCursor for BeechCursor<'_> {
             .ok_or_else(|| rusqlite::Error::ModuleError("invalid row-id array".into()))?;
         Ok(array.value(self.row))
     }
+}
+
+fn set_scalar(ctx: &mut Context, value: &Scalar) -> Result<()> {
+    match value {
+        Scalar::Null => ctx.set_result(&rusqlite::types::Null),
+        Scalar::Boolean(value) => ctx.set_result(value),
+        Scalar::Int32(value) => ctx.set_result(value),
+        Scalar::Int64(value) => ctx.set_result(value),
+        Scalar::UInt64(value) => ctx.set_result(&value.to_string()),
+        Scalar::Float32(value) => ctx.set_result(value),
+        Scalar::Float64(value) => ctx.set_result(value),
+        Scalar::Decimal(value) => ctx.set_result(&decimal_text(value.unscaled(), value.scale() as usize)),
+        Scalar::Utf8(value) => ctx.set_result(value),
+        Scalar::Binary(value) => ctx.set_result(value),
+    }
+}
+
+fn decimal_text(unscaled: i128, scale: usize) -> String {
+    let mut digits = format!("{:0width$}", unscaled.unsigned_abs(), width = scale + 1);
+    if scale > 0 {
+        digits.insert(digits.len() - scale, '.');
+    }
+    if unscaled < 0 {
+        digits.insert(0, '-');
+    }
+    digits
 }
 
 /// Borrow text and binary values directly from the batch; SQLite copies them
@@ -350,15 +755,7 @@ fn set_column(ctx: &mut Context, array: &dyn Array, row: usize) -> Result<()> {
         DataType::UInt64 => ctx.set_result(&value!(UInt64Array).to_string()),
         DataType::Decimal128(_, scale) => {
             let unscaled = value!(Decimal128Array);
-            let scale = *scale as usize;
-            let mut digits = format!("{:0width$}", unscaled.unsigned_abs(), width = scale + 1);
-            if scale > 0 {
-                digits.insert(digits.len() - scale, '.');
-            }
-            if unscaled < 0 {
-                digits.insert(0, '-');
-            }
-            ctx.set_result(&digits)
+            ctx.set_result(&decimal_text(unscaled, *scale as usize))
         }
         typ => Err(rusqlite::Error::ModuleError(format!(
             "unsupported column type {typ}"
@@ -422,9 +819,9 @@ fn from_hex(hex: &str) -> beech_core::Result<Vec<u8>> {
         .collect()
 }
 
-/// Register the read-only Beech virtual table module with a SQLite connection.
+/// Register the writable Beech virtual table module with a SQLite connection.
 pub fn create_beech_module(conn: &rusqlite::Connection) -> Result<()> {
-    const MODULE: Module<'_, BeechTable> = Module::read_only_module();
+    const MODULE: Module<'_, BeechTable> = Module::update_module_with_tx();
     conn.create_module::<BeechTable, _>("beech", &MODULE, None)
 }
 

@@ -37,7 +37,14 @@ immutable references; modified nodes use private temporary IDs in a
 `beech-disk::PageStore`. Decoded nodes stay in an 8 MiB LRU cache. Dirty pages are encoded and spilled into the transaction workspace only on eviction. Repeated resident edits
 perform no scratch encoding, decoding, or file I/O. `Transaction::with_page_cache_bytes(bytes)` changes the
 limit; zero forces disk-only operation. Spilled pages have no in-memory index.
-There is no public API for reading unfinished edits.
+
+`WorkingTable` exposes the same mutable tree for callers that need to read
+unfinished edits. `apply` changes its private root immediately, `scan` plus
+`next_row` streams the current key-ordered view one row at a time, and `finish`
+stages only the reachable final nodes. Its scan retains one decoded leaf in
+addition to the bounded page cache; it does not materialize the table. Dropping
+the working table rolls back its scratch state. SQLite uses this interface for
+read-your-writes transactions.
 
 The shared shaper has a cutoff at four times the logical target plus one record;
 branches require two children before splitting. Empty nodes are removed and

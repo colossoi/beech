@@ -257,6 +257,7 @@ dependencies = [
  "arrow-array",
  "beech-core",
  "beech-disk",
+ "beech-write",
  "bytes",
  "rusqlite",
 ]

@@ -334,3 +334,12 @@ pub trait NodeSource {
     fn get_internal(&self, reference: &NodeRef, schema: &TableSchema) -> Result<Arc<InternalNode>>;
     fn open_leaf(&self, reference: &NodeRef, schema: &TableSchema) -> Result<storage::Leaf>;
 }
+impl<T: NodeSource + ?Sized> NodeSource for Arc<T> {
+    fn get_internal(&self, reference: &NodeRef, schema: &TableSchema) -> Result<Arc<InternalNode>> {
+        (**self).get_internal(reference, schema)
+    }
+
+    fn open_leaf(&self, reference: &NodeRef, schema: &TableSchema) -> Result<storage::Leaf> {
+        (**self).open_leaf(reference, schema)
+    }
+}

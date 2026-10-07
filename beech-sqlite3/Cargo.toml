@@ -14,6 +14,7 @@ loadable_extension = ["rusqlite/loadable_extension"]
 [dependencies]
 rusqlite.workspace = true
 beech-core = { path = "../beech-core" }
+beech-write = { path = "../beech-write" }
 arrow-array = "=59.3.0"
 
 [dev-dependencies]

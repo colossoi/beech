@@ -74,7 +74,17 @@ apply when SQL expressions perform arithmetic on those values.
 
 To use the native SQLite shell, build the adapter with its loadable-extension
 feature. This uses the shell's SQLite API; the default build bundles SQLite for
-the Rust runner and tests.
+the Rust runner and tests. The macOS `/usr/bin/sqlite3` is built with
+`OMIT_LOAD_EXTENSION` and cannot load the adapter. Install SQLite with Homebrew
+and invoke that binary explicitly:
+
+```sh
+brew install sqlite
+"$(brew --prefix sqlite)/bin/sqlite3"
+```
+
+You can verify any shell before using it with `PRAGMA compile_options;`; it must
+not list `OMIT_LOAD_EXTENSION`.
 
 ```powershell
 cargo build -p beech-sqlite3 --lib --no-default-features --features loadable_extension
@@ -92,6 +102,9 @@ Then, from the repository root in the SQLite shell:
 CREATE VIRTUAL TABLE items USING beech('target/sqlite-demo', 'example');
 SELECT count(*) FROM items;
 SELECT rowid, key, label FROM items WHERE key >= 3 ORDER BY key;
+INSERT INTO items(key, label) VALUES (10, 'ten');
+UPDATE items SET label = 'TEN' WHERE key = 10;
+DELETE FROM items WHERE key = 10;
 ```
 
 On Linux/macOS, use `.load ./target/debug/libbeech_sqlite3` and `cp` for the

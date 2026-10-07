@@ -216,7 +216,7 @@ impl Change {
             _ => Err(invalid()),
         }
     }
-    fn memory_size(&self) -> usize {
+    pub(crate) fn memory_size(&self) -> usize {
         std::mem::size_of::<Self>()
             + scalar_bytes(self.key())
             + match self {

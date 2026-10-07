@@ -12,7 +12,7 @@ use beech_core::{
     query::RowCursor,
     BeechError, Id, InternalNode, Key, KeyOrdering, NodeRef, NodeSource, Result, Row, Scalar, Table,
 };
-use beech_disk::{PageStore, SortLimits};
+use beech_disk::{ExternalSort, PageStore, SortLimits, Workspace};
 use std::{
     cmp::Ordering,
     io::{self, BufRead, Write},
@@ -33,6 +33,88 @@ pub enum Change {
     Delete {
         key: Key,
     },
+}
+
+struct OrderedChange {
+    sequence: u64,
+    change: Change,
+}
+
+type ChangeOrder = fn(&OrderedChange, &OrderedChange) -> Ordering;
+
+/// Disk-backed mutations ordered by key at consumption time. Sequence numbers
+/// retain submission order for repeated operations on the same key.
+pub struct MutationBatch {
+    sort: Option<ExternalSort<OrderedChange, ChangeOrder>>,
+    next_sequence: u64,
+}
+
+impl MutationBatch {
+    pub fn new(limits: SortLimits) -> Result<Self> {
+        let workspace = Workspace::new()?;
+        let compare: ChangeOrder = |left, right| {
+            left.change
+                .key()
+                .compare_key(right.change.key())
+                .expect("validated mutation keys")
+                .then_with(|| left.sequence.cmp(&right.sequence))
+        };
+        Ok(Self {
+            sort: Some(ExternalSort::new(
+                &workspace,
+                limits,
+                compare,
+                write_ordered_change,
+                read_ordered_change,
+                |change| change.change.memory_size() + std::mem::size_of::<u64>(),
+            )),
+            next_sequence: 0,
+        })
+    }
+
+    pub fn push(&mut self, change: Change) -> Result<()> {
+        let sequence = self.next_sequence;
+        self.next_sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| BeechError::Query("mutation sequence overflow".into()))?;
+        self.sort
+            .as_mut()
+            .ok_or_else(|| BeechError::Query("mutation batch already consumed".into()))?
+            .push(OrderedChange { sequence, change })?;
+        Ok(())
+    }
+
+    pub fn apply(mut self, working: &mut WorkingTable) -> Result<()> {
+        let mut sorted = self
+            .sort
+            .take()
+            .ok_or_else(|| BeechError::Query("mutation batch already consumed".into()))?
+            .finish()?;
+        for change in sorted.reader()? {
+            working.apply(change?.change)?;
+        }
+        Ok(())
+    }
+}
+
+fn write_ordered_change(change: &OrderedChange, writer: &mut dyn Write) -> io::Result<()> {
+    writer.write_all(&change.sequence.to_le_bytes())?;
+    change.change.write(writer)
+}
+
+fn read_ordered_change(reader: &mut dyn BufRead) -> io::Result<Option<OrderedChange>> {
+    let mut sequence = [0; 8];
+    match reader.read(&mut sequence[..1])? {
+        0 => return Ok(None),
+        1 => reader.read_exact(&mut sequence[1..])?,
+        _ => unreachable!("one-byte read returned more than one byte"),
+    }
+    let change = Change::read(reader)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing mutation"))?;
+    Ok(Some(OrderedChange {
+        sequence: u64::from_le_bytes(sequence),
+        change,
+    }))
 }
 impl Change {
     pub fn key(&self) -> &Key {
@@ -191,6 +273,125 @@ impl WorkingNode {
     }
 }
 
+/// A queryable, private table view backed by the same disk-spilling page cache
+/// used for incremental updates. Mutations are visible to scans immediately;
+/// dropping the value rolls them back.
+pub struct WorkingTable {
+    tree: WorkingTree<std::sync::Arc<dyn NodeSource>>,
+    root: Option<Reference>,
+    max_row_id: i64,
+}
+
+/// Cursor state for an ordered scan of a [`WorkingTable`].
+pub struct WorkingScan {
+    pending: Vec<Reference>,
+    rows: std::vec::IntoIter<Row>,
+}
+
+impl WorkingTable {
+    pub fn new(
+        table: Table,
+        source: std::sync::Arc<dyn NodeSource>,
+        options: BuildOptions,
+        page_cache_bytes: usize,
+    ) -> Result<Self> {
+        let workspace = beech_disk::Workspace::new()?;
+        let root = table.root().map(Reference::stored);
+        let max_row_id = table.max_row_id();
+        Ok(Self {
+            tree: WorkingTree {
+                pages: WorkingNode::pages(&workspace, page_cache_bytes),
+                table,
+                source,
+                options,
+                next_id: 0,
+                stats: TransactionStats::default(),
+            },
+            root,
+            max_row_id,
+        })
+    }
+
+    pub fn table(&self) -> &Table {
+        &self.tree.table
+    }
+
+    pub fn next_row_id(&self) -> Result<i64> {
+        self.max_row_id.checked_add(1).ok_or_else(|| BeechError::Query("rowid space exhausted".into()))
+    }
+
+    pub fn page_stats(&self) -> beech_disk::PageStats {
+        self.tree.pages.stats()
+    }
+
+    pub fn apply(&mut self, change: Change) -> Result<()> {
+        self.tree.stats.operations += 1;
+        if let Change::Insert { row_id, .. } | Change::Update { row_id, .. } = &change {
+            self.max_row_id = self.max_row_id.max(*row_id);
+        }
+        let (mut level, changed) = self.tree.edit(self.root.as_ref(), change, true)?;
+        if changed {
+            while level.len() > 1 {
+                level = self.tree.branches(level, None)?;
+            }
+            self.root = level.pop();
+        }
+        Ok(())
+    }
+
+    pub fn scan(&self) -> WorkingScan {
+        WorkingScan {
+            pending: self.root.clone().into_iter().collect(),
+            rows: Vec::new().into_iter(),
+        }
+    }
+
+    pub fn next_row(&mut self, scan: &mut WorkingScan) -> Result<Option<Row>> {
+        loop {
+            if let Some(row) = scan.rows.next() {
+                return Ok(Some(row));
+            }
+            let Some(reference) = scan.pending.pop() else {
+                return Ok(None);
+            };
+            if reference.height == 0 {
+                scan.rows = self.tree.rows(Some(&reference))?.into_iter();
+            } else {
+                let mut children = self.tree.children(&reference)?;
+                children.reverse();
+                scan.pending.extend(children);
+            }
+        }
+    }
+
+    pub fn row_by_id(&mut self, row_id: i64) -> Result<Option<Row>> {
+        let mut scan = self.scan();
+        while let Some(row) = self.next_row(&mut scan)? {
+            if row.0 == row_id {
+                return Ok(Some(row));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn row_by_key(&mut self, key: &[Scalar]) -> Result<Option<Row>> {
+        let mut scan = self.scan();
+        while let Some(row) = self.next_row(&mut scan)? {
+            match self.tree.table.schema().key_from_row(&row)?.compare_key(&key.to_vec())? {
+                Ordering::Equal => return Ok(Some(row)),
+                Ordering::Greater => return Ok(None),
+                Ordering::Less => (),
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn finish(&mut self, sink: &mut impl ObjectSink) -> Result<Table> {
+        let root = self.root.as_ref().map(|root| self.tree.finalize(root, sink)).transpose()?;
+        self.tree.table.clone().with_max_row_id(self.max_row_id).with_root(root)
+    }
+}
+
 pub(crate) fn apply_ordered(
     changes: impl Iterator<Item = io::Result<Change>>,
     pages: PageStore<WorkingNode>,
@@ -203,8 +404,8 @@ pub(crate) fn apply_ordered(
     let started = std::time::Instant::now();
     let mut tree = WorkingTree {
         pages,
-        table,
-        source,
+        table: table.clone(),
+        source: BorrowedSource(source),
         options,
         next_id: 0,
         stats: TransactionStats {
@@ -237,15 +438,34 @@ pub(crate) fn apply_ordered(
     Ok((table.with_root(root)?, tree.stats))
 }
 
-struct WorkingTree<'a, S> {
+struct BorrowedSource<'a>(&'a dyn NodeSource);
+impl NodeSource for BorrowedSource<'_> {
+    fn get_internal(
+        &self,
+        reference: &NodeRef,
+        schema: &beech_core::TableSchema,
+    ) -> Result<std::sync::Arc<InternalNode>> {
+        self.0.get_internal(reference, schema)
+    }
+
+    fn open_leaf(
+        &self,
+        reference: &NodeRef,
+        schema: &beech_core::TableSchema,
+    ) -> Result<beech_core::storage::Leaf> {
+        self.0.open_leaf(reference, schema)
+    }
+}
+
+struct WorkingTree<S> {
     pages: PageStore<WorkingNode>,
-    table: &'a Table,
-    source: &'a S,
+    table: Table,
+    source: S,
     options: BuildOptions,
     next_id: u64,
     stats: TransactionStats,
 }
-impl<S: NodeSource> WorkingTree<'_, S> {
+impl<S: NodeSource> WorkingTree<S> {
     fn remove(&mut self, reference: &Reference) -> Result<()> {
         if let Location::Working(id) = reference.location {
             self.pages.remove(id)?;
@@ -282,8 +502,8 @@ impl<S: NodeSource> WorkingTree<'_, S> {
         };
         match reference.location {
             Location::Stored(_) => {
-                let table = self.table.with_root(Some(reference.node(self.table)?))?;
-                RowCursor::new(self.source, &table, vec![])?.collect()
+                let table = self.table.with_root(Some(reference.node(&self.table)?))?;
+                RowCursor::new(&self.source, &table, vec![])?.collect()
             }
             Location::Working(id) => Ok(self.pages.read(id, |node| match node {
                 WorkingNode::Leaf(rows) => Ok(rows.clone()),
@@ -298,7 +518,7 @@ impl<S: NodeSource> WorkingTree<'_, S> {
         match reference.location {
             Location::Stored(_) => Ok(self
                 .source
-                .get_internal(&reference.node(self.table)?, self.table.schema())?
+                .get_internal(&reference.node(&self.table)?, self.table.schema())?
                 .children()
                 .iter()
                 .map(Reference::stored)
@@ -463,13 +683,12 @@ impl<S: NodeSource> WorkingTree<'_, S> {
     }
     fn finalize(&mut self, reference: &Reference, sink: &mut impl ObjectSink) -> Result<NodeRef> {
         if let Location::Stored(_) = reference.location {
-            return reference.node(self.table);
+            return reference.node(&self.table);
         }
         let node = if reference.height == 0 {
-            codec::parquet::encode_leaf(
-                self.table.schema(),
-                &batch_from_rows(self.table.schema(), &self.rows(Some(reference))?)?,
-            )?
+            let schema = self.table.schema().clone();
+            let rows = self.rows(Some(reference))?;
+            codec::parquet::encode_leaf(&schema, &batch_from_rows(&schema, &rows)?)?
         } else {
             let children = self
                 .children(reference)?
@@ -502,15 +721,59 @@ mod tests {
     use beech_disk::Workspace;
 
     #[test]
+    fn working_table_scans_disk_backed_mutations_in_key_order() {
+        let workspace = Workspace::new().unwrap();
+        let schema = TableSchema::new(vec![Field::new("k", DataType::Int64, false)], vec![0]).unwrap();
+        let table = Table::new("t", schema, None, -1).unwrap();
+        let source = std::sync::Arc::new(Repository::new(FileStore::new(workspace.path())));
+        let mut working = WorkingTable::new(table, source, BuildOptions::new(64, 8).unwrap(), 0).unwrap();
+        for value in (0..100).rev() {
+            working
+                .apply(Change::Insert {
+                    key: vec![Scalar::Int64(value)],
+                    row_id: value,
+                    record: vec![Scalar::Int64(value)],
+                })
+                .unwrap();
+        }
+        working
+            .apply(Change::Update {
+                key: vec![Scalar::Int64(50)],
+                row_id: 500,
+                record: vec![Scalar::Int64(50)],
+            })
+            .unwrap();
+        working
+            .apply(Change::Delete {
+                key: vec![Scalar::Int64(25)],
+            })
+            .unwrap();
+        assert_eq!(
+            working.row_by_id(500).unwrap().unwrap().1,
+            vec![Scalar::Int64(50)]
+        );
+        assert!(working.row_by_id(25).unwrap().is_none());
+        let mut scan = working.scan();
+        let mut rows = Vec::new();
+        while let Some(row) = working.next_row(&mut scan).unwrap() {
+            rows.push(row);
+        }
+        assert_eq!(rows.len(), 99);
+        assert!(rows.windows(2).all(|rows| rows[0].1[0].compare(&rows[1].1[0]).unwrap().is_lt()));
+        assert_eq!(working.page_stats().resident_bytes, 0);
+        assert!(working.page_stats().bytes_written > 0);
+    }
+
+    #[test]
     fn repeated_edits_reuse_the_same_cached_page() {
         let workspace = Workspace::new().unwrap();
         let schema = TableSchema::new(vec![Field::new("k", DataType::Int64, false)], vec![0]).unwrap();
         let table = Table::new("t", schema, None, 100).unwrap();
-        let source = Repository::new(FileStore::new(workspace.path()));
+        let source = std::sync::Arc::new(Repository::new(FileStore::new(workspace.path())));
         let mut tree = WorkingTree {
             pages: WorkingNode::pages(&workspace, 4096),
-            table: &table,
-            source: &source,
+            table,
+            source,
             options: BuildOptions::new(100_000, 1).unwrap(),
             next_id: 0,
             stats: TransactionStats::default(),

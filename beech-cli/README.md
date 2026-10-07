@@ -9,6 +9,11 @@ cargo run -p beech-cli -- inspect -d /tmp/beech-data <node-id>
 cargo run -p beech-sqlite3-test -- /tmp/beech-data items
 ```
 
+The Rust SQLite runner above uses bundled SQLite and requires no system SQLite
+installation. To use the `.load` command in a native SQLite shell on macOS,
+install SQLite with Homebrew; Apple's `/usr/bin/sqlite3` is built without
+loadable-extension support. See the [native shell instructions](../beech-core/README.md#development).
+
 `load-csv` defaults to replace mode. It replaces the named table and preserves
 all other tables and the previous transaction link. `--mode insert` requires an
 existing table, parses CSV against that table's schema, and rejects duplicate

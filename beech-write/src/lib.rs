@@ -14,7 +14,7 @@ pub use rows::batch_from_rows;
 pub use snapshot::{publish_table, Publication};
 pub use transaction::Transaction;
 pub use tree::build_table;
-pub use update::{apply_changes, Change};
+pub use update::{apply_changes, Change, MutationBatch, WorkingScan, WorkingTable};
 
 /// Stage immutable objects under IDs supplied by the codecs. Existing bytes
 /// must never be overwritten. Callers must supply the correct codec-produced
