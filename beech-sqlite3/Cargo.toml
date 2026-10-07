@@ -12,6 +12,7 @@ bundled = ["rusqlite/bundled"]
 loadable_extension = ["rusqlite/loadable_extension"]
 
 [dependencies]
+beech-disk = { path = "../beech-disk" }
 rusqlite.workspace = true
 beech-core = { path = "../beech-core" }
 beech-write = { path = "../beech-write" }
@@ -19,4 +20,3 @@ arrow-array = "=59.3.0"
 
 [dev-dependencies]
 bytes = "1.10"
-beech-disk = { path = "../beech-disk" }

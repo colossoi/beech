@@ -19,7 +19,7 @@ use arrow_array::{
     StringArray, UInt64Array,
 };
 use beech_core::{
-    BeechError, DataType, Decimal, Id, Key, KeyOrdering, RecordBatch, Row, Scalar, Table,
+    BeechError, DataType, Decimal, Id, KeyOrdering, RecordBatch, Row, Scalar, Table,
     plan::CandidateConstraint,
     query::{ConstraintOp, Scan},
     storage::{FileStore, Repository},
@@ -40,13 +40,16 @@ use rusqlite::{
 use std::{
     borrow::Cow,
     cell::RefCell,
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     ffi::{CStr, CString, c_int},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 mod plan;
+mod row_keys;
+
+use row_keys::RowKeys;
 
 #[repr(C)]
 struct BeechTable {
@@ -65,7 +68,7 @@ struct BeechTable {
 struct WriteState {
     working: RefCell<WorkingTable>,
     mutations: MutationBatch,
-    row_keys: RefCell<HashMap<i64, Key>>,
+    row_keys: RefCell<RowKeys>,
     dirty: bool,
     pending_commit: Option<PendingCommit>,
 }
@@ -113,7 +116,7 @@ impl BeechTable {
                     BuildOptions::default(),
                 )?),
                 mutations: MutationBatch::new(SortLimits::default())?,
-                row_keys: RefCell::new(HashMap::new()),
+                row_keys: RefCell::new(RowKeys::new()?),
                 dirty: false,
                 pending_commit: None,
             });
@@ -235,7 +238,7 @@ impl UpdateVTab<'_> for BeechTable {
         let schema = self.table.schema().clone();
         let state = self.ensure_write().map_err(into_rusqlite_error)?;
         let working = state.working.get_mut();
-        let key = match state.row_keys.get_mut().remove(&row_id) {
+        let key = match state.row_keys.get_mut().remove(row_id).map_err(into_rusqlite_error)? {
             Some(key) => key,
             None => {
                 let row = working
@@ -286,7 +289,7 @@ impl UpdateVTab<'_> for BeechTable {
         let record = sqlite_record(&schema, values)?;
         let state = self.ensure_write().map_err(into_rusqlite_error)?;
         let working = state.working.get_mut();
-        let old_key = match state.row_keys.get_mut().remove(&old_row_id) {
+        let old_key = match state.row_keys.get_mut().remove(old_row_id).map_err(into_rusqlite_error)? {
             Some(key) => key,
             None => {
                 let row = working.row_by_id(old_row_id).map_err(into_rusqlite_error)?.ok_or_else(|| {
@@ -687,7 +690,7 @@ unsafe impl VTabCursor for BeechCursor<'_> {
             let row = row?;
             if let Some(write) = &self.vtab.write {
                 let key = self.vtab.table.schema().key_from_row(row).map_err(into_rusqlite_error)?;
-                write.row_keys.borrow_mut().insert(row.0, key);
+                write.row_keys.borrow_mut().insert(row.0, &key).map_err(into_rusqlite_error)?;
             }
             return Ok(row.0);
         }
