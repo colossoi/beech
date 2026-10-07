@@ -67,7 +67,7 @@ fn explicit_transaction_reads_and_commits_pending_changes() {
 }
 
 #[test]
-fn repeated_key_mutations_keep_transaction_order_after_sorting() {
+fn repeated_key_mutations_keep_transaction_order_at_commit() {
     let tmp = make_test_tree(vec![int_row(1, 10), int_row(4, 40)], vec![0], "t");
     let mut conn = setup_vtab(tmp.path(), "t", "tt");
     let transaction = conn.transaction().unwrap();
@@ -173,4 +173,21 @@ fn alternating_table_writes_preserve_a_shared_repository() {
     let second = setup_vtab(tmp.path(), "u", "tt");
     assert_eq!(rows(&first), vec![(1, 1, 14)]);
     assert_eq!(rows(&second), vec![(1, 1, 140)]);
+}
+
+#[test]
+fn commit_preserves_live_view_after_non_monotonic_key_changes() {
+    let tmp = make_test_tree((0..200).map(|i| int_row(i, i as i32)).collect(), vec![0], "t");
+    let mut conn = setup_vtab(tmp.path(), "t", "tt");
+    let transaction = conn.transaction().unwrap();
+    transaction.execute("UPDATE tt SET k=1000-k,v=v+1", []).unwrap();
+    transaction.execute("DELETE FROM tt WHERE k%3=0", []).unwrap();
+    transaction.execute("INSERT INTO tt(rowid,k,v) VALUES(5000,-1,42)", []).unwrap();
+    transaction.execute("UPDATE tt SET k=2000 WHERE k=-1", []).unwrap();
+    let expected = rows(&transaction);
+    assert_eq!(expected.len(), 134);
+    transaction.commit().unwrap();
+    assert_eq!(rows(&conn), expected);
+    let reopened = setup_vtab(tmp.path(), "t", "tt");
+    assert_eq!(rows(&reopened), expected);
 }

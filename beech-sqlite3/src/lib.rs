@@ -25,7 +25,7 @@ use beech_core::{
     storage::{FileStore, Repository},
 };
 use beech_write::{
-    BuildOptions, Change, FileWriter, MutationBatch, SortLimits, WorkingScan, WorkingTable, Writer,
+    BuildOptions, Change, FileWriter, WorkingScan, WorkingTable, Writer,
     publish_table,
 };
 use plan::AccessPlan;
@@ -67,7 +67,6 @@ struct BeechTable {
 
 struct WriteState {
     working: RefCell<WorkingTable>,
-    mutations: MutationBatch,
     row_keys: RefCell<RowKeys>,
     dirty: bool,
     pending_commit: Option<PendingCommit>,
@@ -115,7 +114,6 @@ impl BeechTable {
                     self.repository.clone(),
                     BuildOptions::default(),
                 )?),
-                mutations: MutationBatch::new(SortLimits::default())?,
                 row_keys: RefCell::new(RowKeys::new()?),
                 dirty: false,
                 pending_commit: None,
@@ -249,7 +247,6 @@ impl UpdateVTab<'_> for BeechTable {
             }
         };
         let change = Change::Delete { key };
-        state.mutations.push(change.clone()).map_err(into_rusqlite_error)?;
         working.apply(change).map_err(into_rusqlite_error)?;
         state.dirty = true;
         Ok(())
@@ -274,7 +271,6 @@ impl UpdateVTab<'_> for BeechTable {
             return Err(rusqlite::Error::ModuleError("duplicate key".into()));
         }
         let change = Change::Insert { key, row_id, record };
-        state.mutations.push(change.clone()).map_err(into_rusqlite_error)?;
         working.apply(change).map_err(into_rusqlite_error)?;
         state.dirty = true;
         Ok(row_id)
@@ -316,7 +312,6 @@ impl UpdateVTab<'_> for BeechTable {
                 row_id: new_row_id,
                 record,
             };
-            state.mutations.push(change.clone()).map_err(into_rusqlite_error)?;
             working.apply(change).map_err(into_rusqlite_error)?;
         } else {
             let delete = Change::Delete { key: old_key };
@@ -325,8 +320,6 @@ impl UpdateVTab<'_> for BeechTable {
                 row_id: new_row_id,
                 record,
             };
-            state.mutations.push(delete.clone()).map_err(into_rusqlite_error)?;
-            state.mutations.push(insert.clone()).map_err(into_rusqlite_error)?;
             working.apply(delete).map_err(into_rusqlite_error)?;
             working.apply(insert).map_err(into_rusqlite_error)?;
         }
@@ -376,18 +369,9 @@ impl TransactionVTab<'_> for BeechTable {
                 self.repository.get_root(&current_root).map_err(into_rusqlite_error)?.transaction_id();
             self.root_id = current_root;
         }
-        let mut commit_view = WorkingTable::new(
-            self.table.as_ref().clone(),
-            self.repository.clone(),
-            BuildOptions::default(),
-        )
-        .map_err(into_rusqlite_error)?;
-        let mutations = std::mem::replace(
-            &mut state.mutations,
-            MutationBatch::new(SortLimits::default()).map_err(into_rusqlite_error)?,
-        );
-        mutations.apply(&mut commit_view).map_err(into_rusqlite_error)?;
-        let table = commit_view.finish(&mut writer).map_err(into_rusqlite_error)?;
+        // Finalize the live transaction view so commit reuses its decoded nodes
+        // and preserves the exact state already observed by transaction reads.
+        let table = state.working.get_mut().finish(&mut writer).map_err(into_rusqlite_error)?;
         let publication = publish_table(
             &mut writer,
             &table,
