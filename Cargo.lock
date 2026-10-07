@@ -266,7 +266,12 @@ dependencies = [
 name = "beech-sqlite3-test"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "beech-core",
+ "beech-disk",
  "beech-sqlite3",
+ "beech-write",
+ "clap",
  "rusqlite",
 ]
 

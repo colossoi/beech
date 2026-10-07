@@ -121,3 +121,56 @@ fn multi_row_updates_and_deletes_keep_the_scan_stable() {
     let reopened = setup_vtab(tmp.path(), "t", "tt");
     assert_eq!(rows(&reopened), expected);
 }
+
+#[test]
+fn alternating_table_writes_preserve_a_shared_repository() {
+    use beech_core::{
+        Id, Table,
+        storage::{FileStore, Repository},
+    };
+    use beech_write::{FileWriter, Writer, publish_table};
+
+    let tmp = make_test_tree(vec![int_row(1, 10)], vec![0], "t");
+    let repository = Repository::new(FileStore::new(tmp.path()));
+    let root = Id::from_hex(std::fs::read_to_string(tmp.path().join("root")).unwrap().trim()).unwrap();
+    let repository = std::sync::Arc::new(repository);
+    let snapshot = repository.snapshot(root).unwrap();
+    let first = snapshot.table("t").unwrap();
+    let second = Table::new(
+        "u",
+        first.schema().clone(),
+        first.root().cloned(),
+        first.max_row_id(),
+    )
+    .unwrap();
+    let mut writer = FileWriter::new(tmp.path()).unwrap();
+    publish_table(
+        &mut writer,
+        &second,
+        snapshot.transaction().tables().clone(),
+        Some(repository.get_root(&root).unwrap().transaction_id()),
+    )
+    .unwrap();
+    writer.commit().unwrap();
+
+    let conn = setup_vtab(tmp.path(), "t", "tt");
+    conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE other USING beech('{}','u')",
+        tmp.path().display()
+    ))
+    .unwrap();
+    // Force both virtual tables to retain snapshots before either one writes.
+    assert_eq!(
+        conn.query_row("SELECT v FROM other", [], |row| row.get::<_, i32>(0)).unwrap(),
+        10
+    );
+    for value in 11..15 {
+        conn.execute("UPDATE tt SET v=?", [value]).unwrap();
+        conn.execute("UPDATE other SET v=?", [value * 10]).unwrap();
+    }
+    drop(conn);
+    let first = setup_vtab(tmp.path(), "t", "tt");
+    let second = setup_vtab(tmp.path(), "u", "tt");
+    assert_eq!(rows(&first), vec![(1, 1, 14)]);
+    assert_eq!(rows(&second), vec![(1, 1, 140)]);
+}

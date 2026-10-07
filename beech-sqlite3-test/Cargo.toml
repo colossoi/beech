@@ -2,7 +2,13 @@
 name = "beech-sqlite3-test"
 version = "0.1.0"
 edition = "2024"
+default-run = "beech-sqlite3-test"
 
 [dependencies]
 rusqlite.workspace = true
 beech-sqlite3 = { path = "../beech-sqlite3"}
+beech-core = { path = "../beech-core" }
+beech-write = { path = "../beech-write" }
+beech-disk = { path = "../beech-disk" }
+anyhow.workspace = true
+clap = { version = "4.5.38", features = ["derive"] }

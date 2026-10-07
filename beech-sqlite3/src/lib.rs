@@ -363,9 +363,18 @@ impl TransactionVTab<'_> for BeechTable {
         )
         .map_err(into_rusqlite_error)?;
         if current_root != self.root_id {
-            return Err(rusqlite::Error::ModuleError(
-                "repository changed since this virtual table connected".into(),
-            ));
+            let snapshot = self.repository.snapshot(current_root).map_err(into_rusqlite_error)?;
+            if snapshot.transaction().tables().get(&self.table_name) != Some(&self.table_id) {
+                return Err(rusqlite::Error::ModuleError(
+                    "repository changed since this virtual table connected".into(),
+                ));
+            }
+            // The writer holds the repository lock. Preserve publications to
+            // other tables while still rejecting changes to our own snapshot.
+            self.tables = snapshot.transaction().tables().clone();
+            self.transaction_id =
+                self.repository.get_root(&current_root).map_err(into_rusqlite_error)?.transaction_id();
+            self.root_id = current_root;
         }
         let mut commit_view = WorkingTable::new(
             self.table.as_ref().clone(),
